@@ -69,10 +69,28 @@ def main():
             help="仅保留笔记点赞数超过此值的博主"
         )
 
+        # Add mode selection
+        run_mode = st.radio(
+            "运行模式",
+            options=["使用现有数据", "运行 MediaCrawler 爬取"],
+            help="选择是使用已有JSON数据还是运行MediaCrawler获取新数据"
+        )
+
+        use_existing = (run_mode == "使用现有数据")
+
         if st.button("🚀 开始发现博主", type="primary", use_container_width=True):
-            with st.spinner("正在搜索博主..."):
-                keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
-                new_count = search_and_extract_users(keywords, min_likes=min_likes)
+            keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
+
+            if not use_existing:
+                st.warning("⚠️ 即将启动 MediaCrawler，需要浏览器交互（登录、验证等）")
+                st.info("请在弹出的浏览器窗口中完成登录步骤")
+
+            with st.spinner("正在搜索博主..." if use_existing else "正在运行 MediaCrawler..."):
+                new_count = search_and_extract_users(
+                    keywords,
+                    min_likes=min_likes,
+                    use_existing=use_existing
+                )
                 st.success(f"✓ 发现 {new_count} 位新博主!")
                 st.rerun()
 
@@ -92,13 +110,26 @@ def main():
             help="每次采集的博主数量"
         )
 
+        max_notes_per_blogger = st.slider(
+            "每个博主爬取笔记数量",
+            min_value=10,
+            max_value=200,
+            value=100,
+            step=10,
+            help="每个博主最多爬取的笔记数量（默认100条）"
+        )
+
         if st.button("📊 开始采集数据", use_container_width=True):
             if pending_count == 0:
                 st.warning("没有待采集的博主")
             else:
-                with st.spinner("正在采集数据..."):
-                    stats = scrape_pending_bloggers(limit=scrape_limit)
-                    st.success(f"✓ 采集完成! 成功: {stats['scraped']}, 失败: {stats['failed']}")
+                with st.spinner(f"正在采集数据（每位博主最多{max_notes_per_blogger}条笔记）..."):
+                    stats = scrape_pending_bloggers(
+                        limit=scrape_limit,
+                        max_notes=max_notes_per_blogger,
+                        use_existing_data=False
+                    )
+                    st.success(f"✓ 采集完成! 成功: {stats['scraped']}, 失败: {stats['failed']}, 笔记: {stats['notes_added']}")
                     st.rerun()
 
         st.markdown("---")

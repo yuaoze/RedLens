@@ -22,6 +22,144 @@ from red_lens.db import BloggerDB, NoteDB, init_db
 from red_lens.discovery import parse_count_str
 
 
+def run_mediacrawler_for_creator(user_id: str, max_notes: int = 100) -> bool:
+    """
+    Run MediaCrawler in creator mode to scrape a specific blogger's notes
+
+    Args:
+        user_id: Xiaohongshu user ID
+        max_notes: Maximum number of notes to crawl (default: 100)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    print(f"\n🔍 Starting MediaCrawler for creator: {user_id}")
+
+    # Prepare MediaCrawler config files
+    base_config_file = MEDIA_CRAWLER_ROOT / "config" / "base_config.py"
+    xhs_config_file = MEDIA_CRAWLER_ROOT / "config" / "xhs_config.py"
+
+    # Read both configs
+    with open(base_config_file, 'r', encoding='utf-8') as f:
+        base_config_content = f.read()
+    with open(xhs_config_file, 'r', encoding='utf-8') as f:
+        xhs_config_content = f.read()
+
+    # Backup both configs
+    base_backup = base_config_file.parent / "base_config.py.pipeline_backup"
+    xhs_backup = xhs_config_file.parent / "xhs_config.py.pipeline_backup"
+
+    with open(base_backup, 'w', encoding='utf-8') as f:
+        f.write(base_config_content)
+    with open(xhs_backup, 'w', encoding='utf-8') as f:
+        f.write(xhs_config_content)
+
+    try:
+        import re
+        import subprocess
+
+        # Modify base_config: Set CRAWLER_TYPE to creator
+        base_config_content = re.sub(
+            r'CRAWLER_TYPE = ".*?"',
+            'CRAWLER_TYPE = "creator"',
+            base_config_content
+        )
+
+        # Set maximum notes count
+        base_config_content = re.sub(
+            r'CRAWLER_MAX_NOTES_COUNT = \d+',
+            f'CRAWLER_MAX_NOTES_COUNT = {max_notes}',
+            base_config_content
+        )
+
+        # Disable comment crawling for faster scraping
+        base_config_content = re.sub(
+            r'ENABLE_GET_COMMENTS\s*=\s*(True|False)',
+            'ENABLE_GET_COMMENTS = False',
+            base_config_content
+        )
+
+        # Save modified base_config
+        with open(base_config_file, 'w', encoding='utf-8') as f:
+            f.write(base_config_content)
+
+        # Modify xhs_config: Set creator URL/ID
+        # MediaCrawler supports both full URL and pure user_id (24 hex chars)
+        # We'll use pure user_id format for simplicity
+
+        # Update XHS_CREATOR_ID_LIST in xhs_config with pure user_id
+        xhs_config_content = re.sub(
+            r'XHS_CREATOR_ID_LIST\s*=\s*\[.*?\]',
+            f'XHS_CREATOR_ID_LIST = ["{user_id}"]',
+            xhs_config_content,
+            flags=re.DOTALL
+        )
+
+        # Save modified xhs_config
+        with open(xhs_config_file, 'w', encoding='utf-8') as f:
+            f.write(xhs_config_content)
+
+        print(f"  ✓ Config updated:")
+        print(f"    • creator mode")
+        print(f"    • user={user_id}")
+        print(f"    • max_notes={max_notes}")
+        print(f"    • comments=disabled")
+
+        # Run MediaCrawler using uv
+        print(f"  🚀 Launching MediaCrawler...")
+
+        # Check if uv is available
+        try:
+            uv_check = subprocess.run(["uv", "--version"], capture_output=True)
+            use_uv = (uv_check.returncode == 0)
+        except FileNotFoundError:
+            use_uv = False
+
+        if use_uv:
+            cmd = ["uv", "run", "main.py", "--platform", "xhs", "--lt", "qrcode", "--type", "creator"]
+        else:
+            cmd = [sys.executable, "main.py"]
+
+        result = subprocess.run(
+            cmd,
+            cwd=MEDIA_CRAWLER_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 minutes timeout
+        )
+
+        if result.returncode == 0:
+            print(f"  ✓ MediaCrawler completed successfully")
+            return True
+        else:
+            print(f"  ✗ MediaCrawler failed with return code {result.returncode}")
+            if result.stderr:
+                print(f"  Error: {result.stderr[:200]}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        print(f"  ✗ MediaCrawler timeout after 10 minutes")
+        return False
+    except Exception as e:
+        print(f"  ✗ Error running MediaCrawler: {e}")
+        return False
+    finally:
+        # Restore both configs
+        with open(base_backup, 'r', encoding='utf-8') as f:
+            original_base = f.read()
+        with open(base_config_file, 'w', encoding='utf-8') as f:
+            f.write(original_base)
+        base_backup.unlink()
+
+        with open(xhs_backup, 'r', encoding='utf-8') as f:
+            original_xhs = f.read()
+        with open(xhs_config_file, 'w', encoding='utf-8') as f:
+            f.write(original_xhs)
+        xhs_backup.unlink()
+
+        print(f"  ✓ Config restored")
+
+
 def clean_note_data(raw_note: Dict[str, Any]) -> Dict[str, Any]:
     """
     Clean and normalize note data from MediaCrawler output
@@ -101,13 +239,14 @@ def load_notes_from_json(json_file: Path) -> List[Dict[str, Any]]:
         return []
 
 
-def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True) -> Dict[str, int]:
+def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_notes: int = 100) -> Dict[str, int]:
     """
     Scrape notes for pending bloggers
 
     Args:
         limit: Maximum number of bloggers to scrape
         use_existing_data: If True, use existing JSON data instead of running MediaCrawler
+        max_notes: Maximum number of notes to crawl per blogger (default: 100)
 
     Returns:
         Dictionary with statistics (scraped, failed, notes_added)
@@ -119,6 +258,8 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True) -> D
     print(f"{'='*60}")
     print(f"Mode: {'Using existing data' if use_existing_data else 'Running MediaCrawler'}")
     print(f"Max bloggers to scrape: {limit}")
+    if not use_existing_data:
+        print(f"Max notes per blogger: {max_notes}")
     print(f"{'='*60}\n")
 
     # Get pending bloggers
@@ -218,10 +359,93 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True) -> D
                 time.sleep(delay)
 
     else:
-        # TODO: Implement actual MediaCrawler execution for specific bloggers
-        print("✗ Running MediaCrawler for specific bloggers not yet implemented")
-        print("  Use use_existing_data=True mode for now")
-        return stats
+        # Run MediaCrawler for each pending blogger
+        print(f"\n{'='*60}")
+        print("Running MediaCrawler for each blogger...")
+        print(f"{'='*60}\n")
+
+        for idx, blogger in enumerate(pending_bloggers, 1):
+            user_id = blogger["user_id"]
+            nickname = blogger["nickname"]
+
+            print(f"🔄 [{idx}/{len(pending_bloggers)}] Processing: {nickname}")
+            print(f"   User ID: {user_id}")
+
+            # Run MediaCrawler for this specific blogger
+            success = run_mediacrawler_for_creator(user_id, max_notes=max_notes)
+
+            if not success:
+                print(f"  ✗ Failed to scrape {nickname}")
+                BloggerDB.update_status(user_id, "error")
+                stats["failed"] += 1
+                continue
+
+            # Load the newly generated data
+            json_dir = MEDIA_CRAWLER_ROOT / "data" / "xhs" / "json"
+
+            # Look for creator content files (MediaCrawler saves creator posts separately)
+            creator_files = list(json_dir.glob("creator_contents_*.json"))
+            if creator_files:
+                latest_file = max(creator_files, key=lambda p: p.stat().st_mtime)
+            else:
+                # Fallback to search contents
+                search_files = list(json_dir.glob("search_contents_*.json"))
+                if search_files:
+                    latest_file = max(search_files, key=lambda p: p.stat().st_mtime)
+                else:
+                    print(f"  ✗ No data files found after scraping")
+                    BloggerDB.update_status(user_id, "error")
+                    stats["failed"] += 1
+                    continue
+
+            # Load and save notes
+            print(f"  📂 Loading from: {latest_file.name}")
+            all_notes = load_notes_from_json(latest_file)
+
+            # Filter notes for this user
+            user_notes = [n for n in all_notes if n["user_id"] == user_id]
+
+            if not user_notes:
+                print(f"  ⚠ No notes found for this user in JSON")
+                BloggerDB.update_status(user_id, "error")
+                stats["failed"] += 1
+                continue
+
+            print(f"  ✓ Found {len(user_notes)} note(s)")
+
+            # Save notes to database
+            notes_added = 0
+            for note in user_notes:
+                try:
+                    success = NoteDB.insert_note(
+                        note_id=note["note_id"],
+                        user_id=note["user_id"],
+                        title=note["title"],
+                        desc=note["desc"],
+                        note_type=note["type"],
+                        likes=note["likes"],
+                        collects=note["collects"],
+                        comments=note["comments"],
+                        create_time=note["create_time"],
+                        cover_url=note["cover_url"]
+                    )
+                    if success:
+                        notes_added += 1
+                except Exception as e:
+                    print(f"    ⚠ Failed to save note {note['note_id']}: {e}")
+
+            print(f"  ✓ Saved {notes_added}/{len(user_notes)} notes to database")
+
+            # Update blogger status
+            BloggerDB.update_status(user_id, "scraped")
+            stats["scraped"] += 1
+            stats["notes_added"] += notes_added
+
+            # Delay between bloggers
+            if idx < len(pending_bloggers):
+                delay = random.randint(10, 30)
+                print(f"  ⏱ Waiting {delay}s before next blogger...")
+                time.sleep(delay)
 
     # Final summary
     print(f"\n{'='*60}")

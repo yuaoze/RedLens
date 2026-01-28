@@ -120,9 +120,9 @@ def extract_bloggers_from_json(json_file: Path, min_likes: int = 200) -> List[Di
         return []
 
 
-async def run_mediacrawler_search(keywords: List[str], max_notes: int = 100) -> bool:
+def run_mediacrawler_sync(keywords: List[str], max_notes: int = 100) -> bool:
     """
-    Run MediaCrawler in search mode to discover bloggers
+    Run MediaCrawler in search mode to discover bloggers (synchronous version)
 
     Args:
         keywords: List of keywords to search (e.g., ["富士扫街", "人像摄影"])
@@ -171,16 +171,42 @@ async def run_mediacrawler_search(keywords: List[str], max_notes: int = 100) -> 
             config_content
         )
 
+        # Disable comment crawling for faster blogger discovery
+        config_content = re.sub(
+            r'ENABLE_GET_COMMENTS = (True|False)',
+            'ENABLE_GET_COMMENTS = False',
+            config_content
+        )
+
         # Save modified config
         with open(config_file, 'w', encoding='utf-8') as f:
             f.write(config_content)
 
-        print(f"✓ MediaCrawler config updated: keywords={keywords_str}, max_notes={max_notes}")
+        print(f"✓ MediaCrawler config updated:")
+        print(f"  • keywords={keywords_str}")
+        print(f"  • max_notes={max_notes}")
+        print(f"  • comments=disabled (faster discovery)")
 
-        # Run MediaCrawler
-        print("🚀 Launching MediaCrawler (this may take a while)...")
+        # Run MediaCrawler using uv (since this project uses uv for dependency management)
+        print("🚀 Launching MediaCrawler with uv run (this may take a while)...")
+
+        # Try to use uv run first, fall back to direct python if uv is not available
+        try:
+            # Check if uv is available
+            uv_check = subprocess.run(["uv", "--version"], capture_output=True)
+            use_uv = (uv_check.returncode == 0)
+        except FileNotFoundError:
+            use_uv = False
+
+        if use_uv:
+            print("  • Using uv run for better dependency isolation")
+            cmd = ["uv", "run", "main.py", "--platform", "xhs", "--lt", "qrcode", "--type", "search"]
+        else:
+            print("  • Using direct python execution (uv not found)")
+            cmd = [sys.executable, "main.py"]
+
         result = subprocess.run(
-            [sys.executable, "main.py"],
+            cmd,
             cwd=MEDIA_CRAWLER_ROOT,
             capture_output=True,
             text=True,
@@ -211,7 +237,13 @@ async def run_mediacrawler_search(keywords: List[str], max_notes: int = 100) -> 
         print("✓ MediaCrawler config restored")
 
 
-def search_and_extract_users(keywords: List[str], min_likes: int = 200, max_notes: int = 100) -> int:
+def search_and_extract_users(
+    keywords: List[str],
+    min_likes: int = 200,
+    max_notes: int = 100,
+    run_crawler: bool = True,
+    use_existing: bool = False
+) -> int:
     """
     Main function: Search for bloggers and save to database
 
@@ -219,6 +251,8 @@ def search_and_extract_users(keywords: List[str], min_likes: int = 200, max_note
         keywords: List of search keywords
         min_likes: Minimum likes threshold for filtering
         max_notes: Maximum notes to crawl per keyword
+        run_crawler: Whether to run MediaCrawler to fetch new data (default: True)
+        use_existing: If True, use existing JSON files without running crawler (default: False)
 
     Returns:
         Number of new bloggers discovered and saved
@@ -226,35 +260,46 @@ def search_and_extract_users(keywords: List[str], min_likes: int = 200, max_note
     # Initialize database
     init_db()
 
-    # Run MediaCrawler search (synchronous wrapper for async function)
-    # Note: Since MediaCrawler is async, we need to handle this carefully
-    # For now, we'll use subprocess to run it as a separate process
-
     print(f"\n{'='*60}")
     print(f"RedLens Blogger Discovery")
     print(f"{'='*60}")
     print(f"Keywords: {', '.join(keywords)}")
     print(f"Min likes threshold: {min_likes}")
     print(f"Max notes per keyword: {max_notes}")
+    print(f"Mode: {'Using existing data' if use_existing else 'Running MediaCrawler'}")
     print(f"{'='*60}\n")
 
-    # For now, we'll work with existing JSON files instead of running MediaCrawler
-    # This allows for testing without actually running the crawler
-
-    # Find the most recent search results
     json_dir = MEDIA_CRAWLER_ROOT / "data" / "xhs" / "json"
     today = datetime.now().strftime("%Y-%m-%d")
     json_file = json_dir / f"search_contents_{today}.json"
 
-    if not json_file.exists():
-        # Try to find any search_contents file
+    # Run MediaCrawler if requested
+    if run_crawler and not use_existing:
+        print("🚀 Running MediaCrawler to fetch new data...")
+        print("⚠ Note: This requires browser interaction (login, verification, etc.)")
+        print("   You may need to manually complete login steps in the browser window.\n")
+
+        # Run MediaCrawler using subprocess
+        success = run_mediacrawler_sync(keywords, max_notes)
+
+        if not success:
+            print("\n⚠ MediaCrawler execution failed or was interrupted.")
+            print("   Falling back to existing data if available...\n")
+            use_existing = True
+        else:
+            print("\n✓ MediaCrawler completed. Proceeding to extract bloggers...\n")
+
+    # Find JSON file (either newly generated or existing)
+    if use_existing or not json_file.exists():
+        # Try to find the most recent search_contents file
         json_files = list(json_dir.glob("search_contents_*.json"))
         if json_files:
             json_file = max(json_files, key=lambda p: p.stat().st_mtime)
-            print(f"ℹ Using existing JSON file: {json_file.name}")
+            print(f"ℹ Using existing JSON file: {json_file.name}\n")
         else:
-            print(f"✗ No search results found. Please run MediaCrawler first with keywords: {keywords}")
-            print(f"  Expected file: {json_file}")
+            print(f"✗ No search results found.")
+            print(f"  Please ensure MediaCrawler has run successfully.")
+            print(f"  Expected directory: {json_dir}")
             return 0
 
     # Extract bloggers from JSON
@@ -297,11 +342,15 @@ def main():
     # Test with example keywords
     keywords = ["富士扫街", "人像摄影", "胶片色调"]
 
-    # Run discovery
+    # Run discovery with existing data (for testing)
+    print("=" * 60)
+    print("TEST MODE: Using existing data")
+    print("=" * 60)
     new_bloggers = search_and_extract_users(
         keywords=keywords,
         min_likes=200,
-        max_notes=100
+        max_notes=100,
+        use_existing=True  # Use existing data for testing
     )
 
     # Show statistics

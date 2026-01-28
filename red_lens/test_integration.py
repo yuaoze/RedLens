@@ -50,10 +50,11 @@ def test_discovery():
     """Test blogger discovery"""
     print_header("TEST 2: Discovery Module")
 
-    # Use existing data
+    # Use existing data for testing (not running real crawler)
     new_count = search_and_extract_users(
         keywords=["摄影"],
-        min_likes=200
+        min_likes=200,
+        use_existing=True  # Use existing data for integration test
     )
 
     print(f"\n✅ Discovery module passed (found {new_count} new bloggers)")

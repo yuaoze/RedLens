@@ -65,10 +65,19 @@ def init_db():
                 crawled_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 cover_url TEXT,
                 local_cover_path TEXT,
+                note_url TEXT,
                 is_outlier BOOLEAN DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES bloggers(user_id)
             )
         """)
+
+        # Migration: Add note_url column if it doesn't exist (for existing databases)
+        try:
+            cursor.execute("ALTER TABLE notes ADD COLUMN note_url TEXT")
+            print("✓ Added note_url column to notes table")
+        except sqlite3.OperationalError:
+            # Column already exists, skip
+            pass
 
         # Create indexes for better query performance
         cursor.execute("""
@@ -137,6 +146,65 @@ class BloggerDB:
             return [dict(row) for row in cursor.fetchall()]
 
     @staticmethod
+    def get_pending_bloggers_by_keyword(keyword: Optional[str] = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get pending bloggers, optionally filtered by keyword
+
+        Args:
+            keyword: Source keyword to filter by (None = all pending bloggers)
+            limit: Maximum number of bloggers to return
+
+        Returns:
+            List of pending blogger dictionaries
+        """
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            if keyword:
+                cursor.execute("""
+                    SELECT * FROM bloggers
+                    WHERE status = 'pending' AND source_keyword LIKE ?
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                """, (f"%{keyword}%", limit))
+            else:
+                cursor.execute("""
+                    SELECT * FROM bloggers
+                    WHERE status = 'pending'
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                """, (limit,))
+
+            return [dict(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def count_pending_by_keyword(keyword: Optional[str] = None) -> int:
+        """
+        Count pending bloggers, optionally filtered by keyword
+
+        Args:
+            keyword: Source keyword to filter by (None = all pending bloggers)
+
+        Returns:
+            Count of pending bloggers
+        """
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            if keyword:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM bloggers
+                    WHERE status = 'pending' AND source_keyword LIKE ?
+                """, (f"%{keyword}%",))
+            else:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM bloggers
+                    WHERE status = 'pending'
+                """)
+
+            return cursor.fetchone()[0]
+
+    @staticmethod
     def update_status(user_id: str, status: str) -> bool:
         """Update blogger status"""
         try:
@@ -184,6 +252,64 @@ class BloggerDB:
             cursor.execute("SELECT COUNT(*) FROM bloggers WHERE status = ?", (status,))
             return cursor.fetchone()[0]
 
+    @staticmethod
+    def reset_blogger_status(user_id: str) -> bool:
+        """Reset blogger status to pending and clear notes"""
+        try:
+            with get_connection() as conn:
+                cursor = conn.cursor()
+                # Delete all notes for this blogger
+                cursor.execute("DELETE FROM notes WHERE user_id = ?", (user_id,))
+                # Reset status to pending
+                cursor.execute("""
+                    UPDATE bloggers
+                    SET status = 'pending', last_update = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                """, (user_id,))
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error resetting blogger {user_id}: {e}")
+            return False
+
+    @staticmethod
+    def delete_blogger(user_id: str) -> bool:
+        """Delete a blogger and all their notes from database"""
+        try:
+            with get_connection() as conn:
+                cursor = conn.cursor()
+                # Delete all notes for this blogger
+                cursor.execute("DELETE FROM notes WHERE user_id = ?", (user_id,))
+                # Delete the blogger
+                cursor.execute("DELETE FROM bloggers WHERE user_id = ?", (user_id,))
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error deleting blogger {user_id}: {e}")
+            return False
+
+    @staticmethod
+    def get_bloggers_by_keyword(keyword: str) -> List[Dict[str, Any]]:
+        """Get bloggers filtered by source keyword"""
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM bloggers
+                WHERE source_keyword LIKE ?
+                ORDER BY last_update DESC
+            """, (f"%{keyword}%",))
+            return [dict(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def get_bloggers_by_status(status: str) -> List[Dict[str, Any]]:
+        """Get bloggers filtered by status"""
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM bloggers
+                WHERE status = ?
+                ORDER BY last_update DESC
+            """, (status,))
+            return [dict(row) for row in cursor.fetchall()]
+
 
 class NoteDB:
     """Database operations for notes table"""
@@ -199,7 +325,8 @@ class NoteDB:
         collects: int = 0,
         comments: int = 0,
         create_time: Optional[str] = None,
-        cover_url: Optional[str] = None
+        cover_url: Optional[str] = None,
+        note_url: Optional[str] = None
     ) -> bool:
         """Insert a new note into the database"""
         try:
@@ -208,10 +335,10 @@ class NoteDB:
                 cursor.execute("""
                     INSERT OR REPLACE INTO notes
                     (note_id, user_id, title, desc, type, likes, collects, comments,
-                     create_time, cover_url)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     create_time, cover_url, note_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (note_id, user_id, title, desc, note_type, likes, collects,
-                      comments, create_time, cover_url))
+                      comments, create_time, cover_url, note_url))
                 return cursor.rowcount > 0
         except Exception as e:
             print(f"Error inserting note {note_id}: {e}")
@@ -311,6 +438,18 @@ class NoteDB:
                 WHERE user_id = ?
             """, (user_id,))
             return cursor.fetchone()[0]
+
+    @staticmethod
+    def delete_notes_by_user(user_id: str) -> int:
+        """Delete all notes for a specific user"""
+        try:
+            with get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM notes WHERE user_id = ?", (user_id,))
+                return cursor.rowcount
+        except Exception as e:
+            print(f"Error deleting notes for user {user_id}: {e}")
+            return 0
 
 
 if __name__ == "__main__":

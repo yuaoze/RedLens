@@ -190,8 +190,16 @@ def clean_note_data(raw_note: Dict[str, Any]) -> Dict[str, Any]:
         # Convert milliseconds to datetime string
         create_time = datetime.fromtimestamp(create_time / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
+    # Get note_id and construct note_url
+    note_id = raw_note.get("note_id")
+    note_url = raw_note.get("note_url", "")
+
+    # If note_url is not in JSON, construct it from note_id
+    if not note_url and note_id:
+        note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+
     cleaned_note = {
-        "note_id": raw_note.get("note_id"),
+        "note_id": note_id,
         "user_id": raw_note.get("user_id"),
         "title": raw_note.get("title", ""),
         "desc": raw_note.get("desc", ""),
@@ -200,7 +208,8 @@ def clean_note_data(raw_note: Dict[str, Any]) -> Dict[str, Any]:
         "collects": collects,
         "comments": comments,
         "create_time": create_time,
-        "cover_url": raw_note.get("image_list", "").split(",")[0] if raw_note.get("image_list") else ""
+        "cover_url": raw_note.get("image_list", "").split(",")[0] if raw_note.get("image_list") else "",
+        "note_url": note_url
     }
 
     return cleaned_note
@@ -338,7 +347,8 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
                         collects=note["collects"],
                         comments=note["comments"],
                         create_time=note["create_time"],
-                        cover_url=note["cover_url"]
+                        cover_url=note["cover_url"],
+                        note_url=note.get("note_url", "")
                     )
                     if success:
                         notes_added += 1
@@ -427,7 +437,8 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
                         collects=note["collects"],
                         comments=note["comments"],
                         create_time=note["create_time"],
-                        cover_url=note["cover_url"]
+                        cover_url=note["cover_url"],
+                        note_url=note.get("note_url", "")
                     )
                     if success:
                         notes_added += 1

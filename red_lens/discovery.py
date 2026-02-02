@@ -319,7 +319,7 @@ def search_and_extract_users(
             user_id=blogger["user_id"],
             nickname=blogger["nickname"],
             avatar_url=blogger["avatar_url"],
-            initial_fans=0,  # We'll get actual fan count in scraping phase
+            initial_fans=0,  # Fans will be fetched during scraping phase
             source_keyword=blogger["source_keyword"]
         )
         if success:

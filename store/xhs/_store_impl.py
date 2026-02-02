@@ -90,7 +90,19 @@ class XhsJsonStoreImplement(AbstractStore):
         await self.writer.write_single_item_to_json(item_type="comments", item=comment_item)
 
     async def store_creator(self, creator_item: Dict):
-        pass
+        """
+        store creator data to json file
+        :param creator_item:
+        :return:
+        """
+        from tools import utils
+        utils.logger.info(f"[XhsJsonStoreImplement.store_creator] CALLED with user_id={creator_item.get('user_id')}")
+        utils.logger.info(f"[XhsJsonStoreImplement.store_creator] About to write to JSON...")
+        try:
+            await self.writer.write_single_item_to_json(item_type="creators", item=creator_item)
+            utils.logger.info(f"[XhsJsonStoreImplement.store_creator] ✓ Successfully wrote to JSON")
+        except Exception as e:
+            utils.logger.error(f"[XhsJsonStoreImplement.store_creator] ✗ Failed to write: {e}", exc_info=True)
 
     def flush(self):
         """

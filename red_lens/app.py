@@ -141,6 +141,42 @@ def main():
             help="每个博主最多爬取的笔记数量（默认100条）"
         )
 
+        # Advanced settings
+        with st.expander("⚙️ 高级设置", expanded=False):
+            # Fans filter
+            enable_fans_filter = st.checkbox(
+                "启用粉丝数过滤",
+                value=False,
+                help="采集前检查博主粉丝数，跳过粉丝数低于阈值的博主"
+            )
+
+            min_fans = 0
+            if enable_fans_filter:
+                min_fans = st.number_input(
+                    "最低粉丝数阈值",
+                    min_value=0,
+                    max_value=1000000,
+                    value=1000,
+                    step=1000,
+                    help="粉丝数低于此值的博主将被跳过，不采集其笔记"
+                )
+
+            st.markdown("---")
+
+            # Batch size
+            batch_size = st.number_input(
+                "批量大小",
+                min_value=1,
+                max_value=20,
+                value=5,
+                step=1,
+                help="每批处理的博主数量。数量越小越稳定，但总耗时越长。推荐5个。"
+            )
+            st.caption("💡 批量处理说明：")
+            st.caption("- 博主数量 ≤ 批量大小：一次性处理")
+            st.caption("- 博主数量 > 批量大小：自动分批处理")
+            st.caption("- 预计时间 ≈ 批次数 × (批量大小 × 笔记数 × 4秒)")
+
         if st.button("📊 开始采集数据", use_container_width=True):
             if pending_count == 0:
                 st.warning("没有待采集的博主")
@@ -163,23 +199,68 @@ def main():
                             st.markdown(f"- {blogger['nickname']} ({blogger.get('source_keyword', 'N/A')})")
 
                     with st.spinner(f"正在采集数据（每位博主最多{max_notes_per_blogger}条笔记）..."):
-                        # Manually scrape the filtered bloggers
-                        from red_lens.pipeline import run_mediacrawler_for_creator, load_notes_from_json
-                        import time
-                        import random
+                        from red_lens.pipeline import (
+                            fetch_creators_fans_batch,
+                            run_mediacrawler_for_creators_batch,
+                            load_notes_from_json
+                        )
 
-                        stats = {"scraped": 0, "failed": 0, "notes_added": 0}
+                        stats = {"scraped": 0, "failed": 0, "notes_added": 0, "skipped_low_fans": 0}
 
-                        for idx, blogger in enumerate(target_bloggers, 1):
-                            user_id = blogger["user_id"]
-                            nickname = blogger["nickname"]
+                        # Phase 1: Batch filter by fans count (if enabled)
+                        qualified_bloggers = []
 
-                            st.text(f"[{idx}/{len(target_bloggers)}] 正在采集: {nickname}")
+                        if min_fans > 0:
+                            st.text(f"📊 Phase 1: 批量获取粉丝数...")
+                            st.text(f"   正在获取 {len(target_bloggers)} 位博主的粉丝数...")
 
-                            # Run MediaCrawler for this blogger
-                            success = run_mediacrawler_for_creator(user_id, max_notes=max_notes_per_blogger)
+                            user_ids = [b["user_id"] for b in target_bloggers]
+                            fans_dict = fetch_creators_fans_batch(user_ids)
+
+                            st.text(f"   ✓ 已获取粉丝数据")
+                            st.text("")
+                            st.text("📋 粉丝数筛选结果:")
+
+                            for blogger in target_bloggers:
+                                user_id = blogger["user_id"]
+                                nickname = blogger["nickname"]
+                                fans_count = fans_dict.get(user_id, 0)
+
+                                # Update fans in database
+                                BloggerDB.update_fans(user_id, current_fans=fans_count)
+
+                                if fans_count < min_fans:
+                                    st.text(f"  ⚠ 跳过: {nickname} - 粉丝 ({fans_count:,}) < 阈值 ({min_fans:,})")
+                                    BloggerDB.update_status(user_id, "error")
+                                    stats["skipped_low_fans"] += 1
+                                else:
+                                    st.text(f"  ✓ 合格: {nickname} - 粉丝 ({fans_count:,})")
+                                    qualified_bloggers.append(blogger)
+
+                            st.text("")
+                            st.text(f"✓ Phase 1 完成: {len(qualified_bloggers)}/{len(target_bloggers)} 位博主通过筛选")
+                            st.text("")
+                        else:
+                            qualified_bloggers = target_bloggers
+
+                        # Phase 2: Batch scrape notes for qualified bloggers
+                        if not qualified_bloggers:
+                            st.warning("没有博主通过粉丝数筛选")
+                        else:
+                            st.text(f"📊 Phase 2: 批量采集笔记...")
+                            st.text(f"   正在采集 {len(qualified_bloggers)} 位博主的笔记...")
+                            st.text(f"   批量大小: {batch_size} 博主/批次")
+
+                            qualified_user_ids = [b["user_id"] for b in qualified_bloggers]
+                            success = run_mediacrawler_for_creators_batch(
+                                qualified_user_ids,
+                                max_notes=max_notes_per_blogger,
+                                batch_size=batch_size
+                            )
 
                             if success:
+                                st.text(f"   ✓ MediaCrawler 运行成功")
+
                                 # Load notes and save to database
                                 json_dir = Path(__file__).parent.parent / "data" / "xhs" / "json"
                                 creator_files = list(json_dir.glob("creator_contents_*.json"))
@@ -187,43 +268,73 @@ def main():
                                 if creator_files:
                                     latest_file = max(creator_files, key=lambda p: p.stat().st_mtime)
                                     all_notes = load_notes_from_json(latest_file)
-                                    user_notes = [n for n in all_notes if n["user_id"] == user_id]
 
-                                    notes_added = 0
-                                    for note in user_notes:
-                                        try:
-                                            NoteDB.insert_note(
-                                                note_id=note["note_id"],
-                                                user_id=note["user_id"],
-                                                title=note["title"],
-                                                desc=note["desc"],
-                                                note_type=note["type"],
-                                                likes=note["likes"],
-                                                collects=note["collects"],
-                                                comments=note["comments"],
-                                                create_time=note["create_time"],
-                                                cover_url=note["cover_url"],
-                                                note_url=note.get("note_url", "")
-                                            )
-                                            notes_added += 1
-                                        except Exception:
-                                            pass
+                                    # Group notes by user_id
+                                    notes_by_user = {}
+                                    for note in all_notes:
+                                        user_id = note["user_id"]
+                                        if user_id in qualified_user_ids:
+                                            if user_id not in notes_by_user:
+                                                notes_by_user[user_id] = []
+                                            notes_by_user[user_id].append(note)
 
-                                    BloggerDB.update_status(user_id, "scraped")
-                                    stats["scraped"] += 1
-                                    stats["notes_added"] += notes_added
+                                    st.text("")
+                                    st.text("📝 保存笔记到数据库:")
+
+                                    for blogger in qualified_bloggers:
+                                        user_id = blogger["user_id"]
+                                        nickname = blogger["nickname"]
+
+                                        if user_id in notes_by_user:
+                                            user_notes = notes_by_user[user_id]
+                                            notes_added = 0
+
+                                            for note in user_notes:
+                                                try:
+                                                    NoteDB.insert_note(
+                                                        note_id=note["note_id"],
+                                                        user_id=note["user_id"],
+                                                        title=note["title"],
+                                                        desc=note["desc"],
+                                                        note_type=note["type"],
+                                                        likes=note["likes"],
+                                                        collects=note["collects"],
+                                                        comments=note["comments"],
+                                                        create_time=note["create_time"],
+                                                        cover_url=note["cover_url"],
+                                                        note_url=note.get("note_url", "")
+                                                    )
+                                                    notes_added += 1
+                                                except Exception:
+                                                    pass
+
+                                            BloggerDB.update_status(user_id, "scraped")
+                                            stats["scraped"] += 1
+                                            stats["notes_added"] += notes_added
+                                            st.text(f"  ✓ {nickname}: {notes_added} 条笔记")
+                                        else:
+                                            BloggerDB.update_status(user_id, "error")
+                                            stats["failed"] += 1
+                                            st.text(f"  ⚠ {nickname}: 未找到笔记")
+
+                                    st.text("")
+                                    st.text(f"✓ Phase 2 完成")
                                 else:
-                                    BloggerDB.update_status(user_id, "error")
-                                    stats["failed"] += 1
+                                    st.error("未找到采集结果文件")
+                                    for blogger in qualified_bloggers:
+                                        BloggerDB.update_status(blogger["user_id"], "error")
+                                        stats["failed"] += 1
                             else:
-                                BloggerDB.update_status(user_id, "error")
-                                stats["failed"] += 1
+                                st.error("MediaCrawler 运行失败")
+                                for blogger in qualified_bloggers:
+                                    BloggerDB.update_status(blogger["user_id"], "error")
+                                    stats["failed"] += 1
 
-                            # Delay between bloggers
-                            if idx < len(target_bloggers):
-                                time.sleep(random.randint(10, 30))
 
-                        st.success(f"✓ 采集完成! 成功: {stats['scraped']}, 失败: {stats['failed']}, 笔记: {stats['notes_added']}")
+                        msg = f"✓ 采集完成! 成功: {stats['scraped']}, 失败: {stats['failed']}, 笔记: {stats['notes_added']}"
+                        if stats['skipped_low_fans'] > 0:
+                            msg += f", 粉丝数不足跳过: {stats['skipped_low_fans']}"
+                        st.success(msg)
                         st.rerun()
 
         st.markdown("---")
@@ -300,12 +411,16 @@ def show_blogger_ranking():
     # Sort by outlier rate
     analyses.sort(key=lambda x: (x["outlier_rate"], x["avg_likes"]), reverse=True)
 
-    # Create DataFrame
+    # Create DataFrame with hyperlink
     df_data = []
     for analysis in analyses:
         blogger = analysis["blogger"]
+        fans_count = blogger.get("current_fans", 0) or blogger.get("initial_fans", 0)
+        url = f"https://www.xiaohongshu.com/user/profile/{blogger['user_id']}"
         df_data.append({
             "博主昵称": blogger["nickname"],
+            "主页链接": url,  # Separate column for hyperlink
+            "粉丝数": fans_count if fans_count > 0 else 0,
             "总笔记数": analysis["total_notes"],
             "平均点赞": int(analysis["avg_likes"]),
             "爆款数量": analysis["outlier_count"],
@@ -517,17 +632,22 @@ def show_detailed_analysis():
     blogger = analysis["blogger"]
 
     # Display header
-    col1, col2, col3 = st.columns([1, 3, 1])
+    col1, col2, col3, col4 = st.columns([1, 3, 1.5, 1])
     with col1:
         if blogger["avatar_url"]:
             st.image(blogger["avatar_url"], width=150)
         else:
             st.info("无头像")
     with col2:
-        st.subheader(blogger["nickname"])
+        st.subheader(blogger['nickname'])
+        # 添加博主主页链接按钮
+        url = f"https://www.xiaohongshu.com/user/profile/{blogger['user_id']}"
         st.caption(f"User ID: {blogger['user_id']}")
         st.caption(f"状态: {blogger['status']} | 来源: {blogger['source_keyword']}")
     with col3:
+        st.markdown("###  ")  # Spacing
+        st.link_button("🔗 访问主页", url, use_container_width=True)
+    with col4:
         st.markdown("###  ")  # Spacing
         if st.button("🗑️ 清空数据", key=f"reset_{selected_user_id}", type="secondary", use_container_width=True):
             st.session_state[f"show_confirm_reset_{selected_user_id}"] = True
@@ -566,14 +686,17 @@ def show_detailed_analysis():
     with col4:
         st.metric("爆款率", f"{analysis['outlier_rate']:.1%}")
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.metric("总点赞", f"{analysis['total_likes']:,}")
+        fans_count = blogger.get("current_fans", 0) or blogger.get("initial_fans", 0)
+        st.metric("粉丝数", f"{fans_count:,}" if fans_count > 0 else "未采集")
     with col2:
-        st.metric("总收藏", f"{analysis['total_collects']:,}")
+        st.metric("总点赞", f"{analysis['total_likes']:,}")
     with col3:
-        st.metric("总评论", f"{analysis['total_comments']:,}")
+        st.metric("总收藏", f"{analysis['total_collects']:,}")
     with col4:
+        st.metric("总评论", f"{analysis['total_comments']:,}")
+    with col5:
         st.metric("平均互动", f"{analysis['avg_engagement']:.0f}")
 
     st.markdown("---")
@@ -679,7 +802,7 @@ def show_blogger_management():
 
     # Filters
     st.subheader("🔍 筛选条件")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         # Status filter
@@ -697,6 +820,21 @@ def show_blogger_management():
         keyword_options = ["全部关键词"] + sorted(list(keywords))
         selected_keyword = st.selectbox("按来源关键词筛选", keyword_options)
 
+    with col3:
+        # Fans filter
+        enable_fans_filter = st.checkbox("启用粉丝数筛选", value=False)
+        if enable_fans_filter:
+            min_fans_filter = st.number_input(
+                "最低粉丝数",
+                min_value=0,
+                max_value=1000000,
+                value=1000,
+                step=1000,
+                help="只显示粉丝数大于等于此值的博主"
+            )
+        else:
+            min_fans_filter = 0
+
     # Apply filters
     filtered_bloggers = all_bloggers
 
@@ -705,6 +843,12 @@ def show_blogger_management():
 
     if selected_keyword != "全部关键词":
         filtered_bloggers = [b for b in filtered_bloggers if b.get("source_keyword") == selected_keyword]
+
+    if enable_fans_filter and min_fans_filter > 0:
+        filtered_bloggers = [
+            b for b in filtered_bloggers
+            if (b.get("current_fans", 0) or b.get("initial_fans", 0)) >= min_fans_filter
+        ]
 
     st.info(f"筛选后: {len(filtered_bloggers)} 位博主")
 
@@ -735,17 +879,19 @@ def show_blogger_management():
 
     # Create a table-like display with checkboxes
     for idx, blogger in enumerate(filtered_bloggers):
-        col1, col2, col3, col4, col5 = st.columns([0.5, 2, 1.5, 1, 1])
+        col1, col2, col3, col4, col5, col6 = st.columns([0.5, 2, 1.5, 1, 1, 1])
 
         with col1:
             is_selected = blogger["user_id"] in st.session_state.selected_bloggers
-            if st.checkbox("", value=is_selected, key=f"cb_{blogger['user_id']}_{idx}"):
+            if st.checkbox("选择", value=is_selected, key=f"cb_{blogger['user_id']}_{idx}", label_visibility="hidden"):
                 st.session_state.selected_bloggers.add(blogger["user_id"])
             else:
                 st.session_state.selected_bloggers.discard(blogger["user_id"])
 
         with col2:
-            st.markdown(f"**{blogger['nickname']}**")
+            # 博主名称作为超链接，点击跳转到小红书主页
+            url = f"https://www.xiaohongshu.com/user/profile/{blogger['user_id']}"
+            st.markdown(f"[{blogger['nickname']}]({url})")
 
         with col3:
             st.caption(f"关键词: {blogger.get('source_keyword', 'N/A')}")
@@ -755,6 +901,13 @@ def show_blogger_management():
             st.caption(f"{status_emoji.get(blogger['status'], '❓')} {blogger['status']}")
 
         with col5:
+            fans = blogger.get("current_fans", 0) or blogger.get("initial_fans", 0)
+            if fans > 0:
+                st.caption(f"👥 {fans:,}")
+            else:
+                st.caption("👥 未采集")
+
+        with col6:
             # Get note count
             note_count = NoteDB.count_notes_by_user(blogger["user_id"])
             st.caption(f"📝 {note_count} 笔记")

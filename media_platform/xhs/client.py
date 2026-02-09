@@ -19,7 +19,7 @@
 
 import asyncio
 import json
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Union
 from urllib.parse import urlencode
 
 import httpx
@@ -545,6 +545,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         callback: Optional[Callable] = None,
         xsec_token: str = "",
         xsec_source: str = "pc_feed",
+        exclude_note_ids: Optional[Set[str]] = None,
     ) -> List[Dict]:
         """
         Get all posts published by specified user, this method will continuously find all post information under a user
@@ -554,6 +555,7 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             callback: Update callback function after one pagination crawl ends
             xsec_token: Verification token
             xsec_source: Channel source
+            exclude_note_ids: Set of note IDs to exclude (for resume/dedup)
 
         Returns:
 
@@ -561,6 +563,8 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
         result = []
         notes_has_more = True
         notes_cursor = ""
+        total_filtered = 0  # Track how many notes were filtered out
+
         while notes_has_more and len(result) < config.CRAWLER_MAX_NOTES_COUNT:
             notes_res = await self.get_notes_by_creator(
                 user_id, notes_cursor, xsec_token=xsec_token, xsec_source=xsec_source
@@ -580,9 +584,28 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
                 break
 
             notes = notes_res["notes"]
-            utils.logger.info(
-                f"[XiaoHongShuClient.get_all_notes_by_creator] got user_id:{user_id} notes len : {len(notes)}"
-            )
+
+            # Smart filtering: Skip already collected notes
+            if exclude_note_ids:
+                filtered_notes = []
+                for note in notes:
+                    note_id = note.get("note_id", "")
+                    if note_id and note_id not in exclude_note_ids:
+                        filtered_notes.append(note)
+                    else:
+                        total_filtered += 1
+
+                if filtered_notes:
+                    utils.logger.info(
+                        f"[XiaoHongShuClient.get_all_notes_by_creator] user_id:{user_id} "
+                        f"fetched {len(notes)} notes, filtered {len(notes) - len(filtered_notes)} duplicates, "
+                        f"keeping {len(filtered_notes)} new notes"
+                    )
+                notes = filtered_notes
+            else:
+                utils.logger.info(
+                    f"[XiaoHongShuClient.get_all_notes_by_creator] got user_id:{user_id} notes len : {len(notes)}"
+                )
 
             remaining = config.CRAWLER_MAX_NOTES_COUNT - len(result)
             if remaining <= 0:
@@ -595,9 +618,15 @@ class XiaoHongShuClient(AbstractApiClient, ProxyRefreshMixin):
             result.extend(notes_to_add)
             await asyncio.sleep(crawl_interval)
 
-        utils.logger.info(
-            f"[XiaoHongShuClient.get_all_notes_by_creator] Finished getting notes for user {user_id}, total: {len(result)}"
-        )
+        if exclude_note_ids and total_filtered > 0:
+            utils.logger.info(
+                f"[XiaoHongShuClient.get_all_notes_by_creator] Finished for user {user_id}: "
+                f"collected {len(result)} new notes, filtered {total_filtered} duplicates"
+            )
+        else:
+            utils.logger.info(
+                f"[XiaoHongShuClient.get_all_notes_by_creator] Finished getting notes for user {user_id}, total: {len(result)}"
+            )
         return result
 
     async def get_note_short_url(self, note_id: str) -> Dict:

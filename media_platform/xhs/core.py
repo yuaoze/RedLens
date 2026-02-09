@@ -205,6 +205,18 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             # Use fixed crawling interval
             crawl_interval = config.CRAWLER_MAX_SLEEP_SEC
+
+            # RedLens: Get exclude note IDs for this user (for resume/dedup)
+            exclude_note_ids = None
+            if hasattr(config, 'XHS_EXCLUDE_NOTE_IDS_MAP') and config.XHS_EXCLUDE_NOTE_IDS_MAP:
+                exclude_list = config.XHS_EXCLUDE_NOTE_IDS_MAP.get(user_id, [])
+                if exclude_list:
+                    exclude_note_ids = set(exclude_list)
+                    utils.logger.info(
+                        f"[XiaoHongShuCrawler.get_creators_and_notes] Excluding {len(exclude_note_ids)} "
+                        f"already collected notes for user {user_id}"
+                    )
+
             # Get all note information of the creator
             all_notes_list = await self.xhs_client.get_all_notes_by_creator(
                 user_id=user_id,
@@ -212,6 +224,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 callback=self.fetch_creator_notes_detail,
                 xsec_token=creator_info.xsec_token,
                 xsec_source=creator_info.xsec_source,
+                exclude_note_ids=exclude_note_ids,
             )
 
             note_ids = []

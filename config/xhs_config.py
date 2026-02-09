@@ -31,7 +31,9 @@ XHS_SPECIFIED_NOTE_URL_LIST = [
 
 # 指定创作者URL列表，需要携带xsec_token和xsec_source参数
 
-XHS_CREATOR_ID_LIST = [
-    "https://www.xiaohongshu.com/user/profile/5f58bd990000000001003753?xsec_token=ABYVg1evluJZZzpMX-VWzchxQ1qSNVW3r-jOEnKqMcgZw=&xsec_source=pc_search"
-    # ........................
-]
+XHS_CREATOR_ID_LIST = ["https://www.xiaohongshu.com/user/profile/5bb231a6aa7db30001ae9021", "https://www.xiaohongshu.com/user/profile/5c9ecda100000000110186a9", "https://www.xiaohongshu.com/user/profile/62c7ce47000000000303ff5f"]
+
+# RedLens: 已采集笔记ID列表（用于恢复采集时过滤重复）
+# 格式: {"user_id_1": ["note_id_1", "note_id_2", ...], "user_id_2": [...]}
+XHS_EXCLUDE_NOTE_IDS_MAP = {
+}

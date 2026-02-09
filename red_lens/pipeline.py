@@ -95,6 +95,69 @@ def fetch_creator_fans_via_mediacrawler(user_id: str) -> int:
     return result.get(user_id, 0)
 
 
+def _run_mediacrawler_with_exclude_filter(user_ids: List[str], max_notes: int, exclude_note_ids_map: Dict[str, List[str]], batch_size: int = 5) -> bool:
+    """
+    Run MediaCrawler with smart note filtering (excludes already collected notes at source)
+
+    Args:
+        user_ids: List of user IDs to crawl
+        max_notes: Maximum notes to collect per user
+        exclude_note_ids_map: Map of user_id -> list of note_ids to exclude
+        batch_size: Number of bloggers to process in each batch (default: 5)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    # Temporarily modify xhs_config to add exclude_note_ids_map
+    xhs_config_file = MEDIA_CRAWLER_ROOT / "config" / "xhs_config.py"
+
+    with open(xhs_config_file, 'r', encoding='utf-8') as f:
+        xhs_config_content = f.read()
+
+    # Backup original config
+    xhs_backup = xhs_config_file.parent / "xhs_config.py.pipeline_backup"
+    with open(xhs_backup, 'w', encoding='utf-8') as f:
+        f.write(xhs_config_content)
+
+    try:
+        import re
+
+        # Update XHS_EXCLUDE_NOTE_IDS_MAP
+        # Convert exclude_note_ids_map to Python code string
+        map_str = "{\n"
+        for user_id, note_ids in exclude_note_ids_map.items():
+            # Only include first 1000 IDs to avoid config file being too large
+            note_ids_subset = note_ids[:1000] if len(note_ids) > 1000 else note_ids
+            map_str += f'    "{user_id}": {note_ids_subset},\n'
+        map_str += "}"
+
+        # Replace XHS_EXCLUDE_NOTE_IDS_MAP value
+        xhs_config_content = re.sub(
+            r'XHS_EXCLUDE_NOTE_IDS_MAP\s*=\s*\{[^}]*\}',
+            f'XHS_EXCLUDE_NOTE_IDS_MAP = {map_str}',
+            xhs_config_content,
+            flags=re.DOTALL
+        )
+
+        # Write updated config
+        with open(xhs_config_file, 'w', encoding='utf-8') as f:
+            f.write(xhs_config_content)
+
+        # Run MediaCrawler with updated config
+        success = run_mediacrawler_for_creators_batch(user_ids, max_notes=max_notes, batch_size=batch_size)
+
+        return success
+
+    finally:
+        # Restore original config
+        if xhs_backup.exists():
+            with open(xhs_backup, 'r', encoding='utf-8') as f:
+                original_content = f.read()
+            with open(xhs_config_file, 'w', encoding='utf-8') as f:
+                f.write(original_content)
+            xhs_backup.unlink()  # Delete backup
+
+
 def run_mediacrawler_for_creators_batch(user_ids: List[str], max_notes: int = 100, batch_size: int = 5) -> bool:
     """
     Run MediaCrawler in creator mode to scrape multiple bloggers at once
@@ -257,41 +320,62 @@ def _run_mediacrawler_for_creators_single_batch(user_ids: List[str], max_notes: 
         else:
             cmd = [sys.executable, "main.py"]
 
-        result = subprocess.run(
+        print(f"\n{'='*60}")
+        print(f"MediaCrawler Output (Real-time):")
+        print(f"{'='*60}\n")
+
+        # Run with real-time output streaming
+        process = subprocess.Popen(
             cmd,
             cwd=MEDIA_CRAWLER_ROOT,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
             text=True,
-            timeout=timeout_seconds  # Dynamic timeout
+            bufsize=1,  # Line buffered
+            universal_newlines=True
         )
 
-        if result.returncode == 0:
+        # Stream output in real-time
+        output_lines = []
+        try:
+            for line in process.stdout:
+                # Print to console in real-time
+                print(line, end='')
+                # Also collect for later analysis
+                output_lines.append(line)
+
+            # Wait for process to complete with timeout
+            return_code = process.wait(timeout=timeout_seconds)
+
+        except subprocess.TimeoutExpired:
+            print(f"\n⚠️  MediaCrawler timeout after {timeout_seconds}s")
+            process.kill()
+            return_code = -1
+        except Exception as e:
+            print(f"\n✗ Error during MediaCrawler execution: {e}")
+            process.kill()
+            return_code = -1
+
+        print(f"\n{'='*60}")
+        print(f"MediaCrawler Finished")
+        print(f"{'='*60}\n")
+
+        if return_code == 0:
             print(f"  ✓ MediaCrawler completed successfully")
-
-            # Print MediaCrawler logs for debugging
-            if result.stdout:
-                print(f"\n  📋 MediaCrawler Key Logs:")
-                output_lines = result.stdout.strip().split('\n')
-                # Filter for relevant log lines
-                for line in output_lines:
-                    if any(keyword in line for keyword in ['save_creator', 'store_creator', 'CALLED', 'ERROR', 'Exception', 'Traceback', 'creator:']):
-                        print(f"    {line}")
-
             return True
         else:
-            print(f"  ✗ MediaCrawler failed with return code {result.returncode}")
-            if result.stderr:
-                print(f"\n  ❌ Error output:")
-                print(result.stderr)
+            print(f"  ✗ MediaCrawler failed with return code {return_code}")
+            # Show last 20 lines of output for debugging
+            if output_lines:
+                print(f"\n  ❌ Last 20 lines of output:")
+                for line in output_lines[-20:]:
+                    print(f"    {line}", end='')
             return False
 
-    except subprocess.TimeoutExpired:
-        timeout_min = timeout_seconds // 60
-        print(f"  ✗ MediaCrawler timeout after {timeout_min} minutes")
-        print(f"  💡 Tip: Try reducing the number of creators or notes per creator")
-        return False
     except Exception as e:
         print(f"  ✗ Error running MediaCrawler: {e}")
+        import traceback
+        traceback.print_exc()
         return False
     finally:
         # Restore both configs
@@ -413,23 +497,32 @@ def load_notes_from_json(json_file: Path) -> List[Dict[str, Any]]:
         return []
 
 
-def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_notes: int = 100, min_fans: int = 0) -> Dict[str, int]:
+def scrape_pending_bloggers(
+    limit: int = 5,
+    use_existing_data: bool = True,
+    max_notes: int = 100,
+    min_fans: int = 0,
+    resume_partial: bool = True,
+    batch_size: int = 5
+) -> Dict[str, int]:
     """
-    Scrape notes for pending bloggers
+    Scrape notes for pending bloggers with resume capability
 
     Args:
         limit: Maximum number of bloggers to scrape
         use_existing_data: If True, use existing JSON data instead of running MediaCrawler
         max_notes: Maximum number of notes to crawl per blogger (default: 100)
         min_fans: Minimum fans threshold - skip bloggers with fewer fans (default: 0 = no filtering)
+        resume_partial: If True, resume incomplete scraping for partial status bloggers
+        batch_size: Number of bloggers to process in each batch when running MediaCrawler (default: 5)
 
     Returns:
-        Dictionary with statistics (scraped, failed, notes_added, skipped_low_fans)
+        Dictionary with statistics (scraped, failed, notes_added, skipped_low_fans, resumed)
     """
     init_db()
 
     print(f"\n{'='*60}")
-    print(f"RedLens Deep Scraping Pipeline")
+    print(f"RedLens Deep Scraping Pipeline v1.2.0")
     print(f"{'='*60}")
     print(f"Mode: {'Using existing data' if use_existing_data else 'Running MediaCrawler'}")
     print(f"Max bloggers to scrape: {limit}")
@@ -437,24 +530,40 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
         print(f"Max notes per blogger: {max_notes}")
     if min_fans > 0:
         print(f"Min fans threshold: {min_fans:,}")
+    print(f"Resume partial scraping: {'Enabled' if resume_partial else 'Disabled'}")
     print(f"{'='*60}\n")
 
-    # Get pending bloggers
+    # Get pending and resumable bloggers
     pending_bloggers = BloggerDB.get_pending_bloggers(limit=limit)
+    resumable_count = BloggerDB.count_resumable_bloggers()
 
-    if not pending_bloggers:
-        print("✓ No pending bloggers to scrape")
-        return {"scraped": 0, "failed": 0, "notes_added": 0, "skipped_low_fans": 0}
+    target_bloggers = []
 
-    print(f"📋 Found {len(pending_bloggers)} pending blogger(s):")
-    for blogger in pending_bloggers:
-        print(f"  • {blogger['nickname']} (ID: {blogger['user_id'][:8]}...)")
+    if resume_partial and resumable_count > 0:
+        resumable_bloggers = BloggerDB.get_resumable_bloggers(limit=limit)
+        print(f"📦 Found {resumable_count} blogger(s) with partial scraping to resume")
+        target_bloggers.extend(resumable_bloggers)
+
+    target_bloggers.extend(pending_bloggers[:max(0, limit - len(target_bloggers))])
+
+    if not target_bloggers:
+        print("✓ No bloggers to scrape")
+        return {"scraped": 0, "failed": 0, "notes_added": 0, "skipped_low_fans": 0, "resumed": 0}
+
+    print(f"📋 Found {len(target_bloggers)} blogger(s) to process:")
+    for blogger in target_bloggers:
+        progress = BloggerDB.get_scrape_progress(blogger['user_id'])
+        status_label = progress['scrape_status']
+        if progress['notes_collected'] > 0:
+            status_label += f" ({progress['notes_collected']}/{progress['notes_target']} notes)"
+        print(f"  • {blogger['nickname']} (ID: {blogger['user_id'][:8]}...) [{status_label}]")
 
     stats = {
         "scraped": 0,
         "failed": 0,
         "notes_added": 0,
-        "skipped_low_fans": 0
+        "skipped_low_fans": 0,
+        "resumed": 0
     }
 
     # Phase 1: Filter bloggers by fans count (if enabled)
@@ -466,14 +575,14 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
         print(f"{'='*60}\n")
 
         # Collect all user IDs
-        user_ids = [b["user_id"] for b in pending_bloggers]
+        user_ids = [b["user_id"] for b in target_bloggers]
 
         # Batch fetch fans for all bloggers
         print(f"Fetching fans count for {len(user_ids)} blogger(s) in batch...")
         fans_dict = fetch_creators_fans_batch(user_ids)
 
         # Filter based on threshold
-        for blogger in pending_bloggers:
+        for blogger in target_bloggers:
             user_id = blogger["user_id"]
             nickname = blogger["nickname"]
             fans_count = fans_dict.get(user_id, 0)
@@ -491,13 +600,13 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
 
         print(f"\n{'='*60}")
         print(f"Filtering complete:")
-        print(f"  • Total bloggers: {len(pending_bloggers)}")
+        print(f"  • Total bloggers: {len(target_bloggers)}")
         print(f"  • Qualified: {len(qualified_bloggers)}")
         print(f"  • Skipped (low fans): {stats['skipped_low_fans']}")
         print(f"{'='*60}\n")
     else:
         # No filtering, all bloggers are qualified
-        qualified_bloggers = pending_bloggers
+        qualified_bloggers = target_bloggers
         print(f"\n✓ Fans filtering disabled, proceeding with all {len(qualified_bloggers)} bloggers\n")
 
     # If no qualified bloggers, return early
@@ -539,17 +648,34 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
             user_id = blogger["user_id"]
             nickname = blogger["nickname"]
 
-            print(f"🔄 [{idx}/{len(qualified_bloggers)}] Processing: {nickname}")
+            # Check progress
+            progress = BloggerDB.get_scrape_progress(user_id)
+            notes_collected = progress['notes_collected']
+            is_resuming = progress['scrape_status'] == 'partial'
+
+            if notes_collected >= max_notes:
+                print(f"✓ [{idx}/{len(qualified_bloggers)}] Skipped: {nickname} - Already completed ({notes_collected}/{max_notes} notes)")
+                BloggerDB.update_scrape_progress(user_id, notes_collected, max_notes, 'completed')
+                continue
+
+            if is_resuming:
+                print(f"🔄 [{idx}/{len(qualified_bloggers)}] Resuming: {nickname} ({notes_collected}/{max_notes} notes)")
+                stats["resumed"] += 1
+            else:
+                print(f"🔄 [{idx}/{len(qualified_bloggers)}] Processing: {nickname}")
+
+            # Mark as in progress
+            BloggerDB.update_scrape_progress(user_id, notes_collected, max_notes, 'in_progress')
 
             # Check if we have notes for this user
             if user_id not in notes_by_user:
                 print(f"  ⚠ No notes found for this user")
-                BloggerDB.update_status(user_id, "error")
+                BloggerDB.update_scrape_progress(user_id, notes_collected, max_notes, 'partial', 'No notes in JSON')
                 stats["failed"] += 1
                 continue
 
             user_notes = notes_by_user[user_id]
-            print(f"  ✓ Found {len(user_notes)} note(s)")
+            print(f"  ✓ Found {len(user_notes)} note(s) in JSON")
 
             # Save notes to database
             notes_added = 0
@@ -573,11 +699,31 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
                 except Exception as e:
                     print(f"    ⚠ Failed to save note {note['note_id']}: {e}")
 
-            print(f"  ✓ Saved {notes_added}/{len(user_notes)} notes to database")
+            # Count actual notes in database
+            total_collected = NoteDB.count_notes_by_user(user_id)
+            print(f"  ✓ Saved {notes_added}/{len(user_notes)} notes (Total in DB: {total_collected})")
 
-            # Update blogger status
-            BloggerDB.update_status(user_id, "scraped")
-            stats["scraped"] += 1
+            # Update progress and status
+            # Important: If we got fewer notes than requested, it means the blogger has no more notes
+            remaining_needed = max_notes - notes_collected
+            if total_collected >= max_notes:
+                # Reached or exceeded target
+                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
+                BloggerDB.update_status(user_id, "scraped")
+                print(f"  ✓ Status: completed")
+                stats["scraped"] += 1
+            elif len(user_notes) < remaining_needed:
+                # Got fewer notes than expected, meaning blogger has no more notes
+                # Adjust target to actual collected amount and mark as completed
+                BloggerDB.update_scrape_progress(user_id, total_collected, total_collected, 'completed')
+                BloggerDB.update_status(user_id, "scraped")
+                print(f"  ✓ Status: completed (blogger has only {total_collected} notes total, adjusted target)")
+                stats["scraped"] += 1
+            else:
+                # Still have more notes to collect
+                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'partial')
+                print(f"  ⚠ Status: partial ({total_collected}/{max_notes} notes)")
+
             stats["notes_added"] += notes_added
 
             # Simulate delay between bloggers (10-30 seconds)
@@ -590,14 +736,51 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
         # Run MediaCrawler for all qualified bloggers in batch
         qualified_user_ids = [b["user_id"] for b in qualified_bloggers]
 
-        print(f"Running MediaCrawler for {len(qualified_user_ids)} blogger(s) in batch...")
-        success = run_mediacrawler_for_creators_batch(qualified_user_ids, max_notes=max_notes)
+        # Mark all bloggers as in_progress BEFORE starting MediaCrawler
+        print(f"\n📝 Marking {len(qualified_user_ids)} blogger(s) as in_progress...")
+
+        # Build exclude note IDs map for smart filtering
+        exclude_note_ids_map = {}
+        for blogger in qualified_bloggers:
+            user_id = blogger["user_id"]
+            progress = BloggerDB.get_scrape_progress(user_id)
+
+            # Get existing note IDs for this user
+            existing_note_ids = NoteDB.get_note_ids_by_user(user_id)
+
+            if existing_note_ids:
+                exclude_note_ids_map[user_id] = existing_note_ids
+                print(f"  • {blogger['nickname']}: {len(existing_note_ids)} existing notes to exclude")
+
+            BloggerDB.update_scrape_progress(
+                user_id=user_id,
+                notes_collected=progress['notes_collected'],
+                notes_target=max_notes,
+                scrape_status='in_progress'
+            )
+        print(f"✓ All bloggers marked as in_progress\n")
+
+        # Configure MediaCrawler to exclude already collected notes
+        if exclude_note_ids_map:
+            print(f"📋 Smart filtering enabled: excluding {sum(len(ids) for ids in exclude_note_ids_map.values())} existing notes across {len(exclude_note_ids_map)} blogger(s)\n")
+
+        print(f"🔍 Running MediaCrawler for {len(qualified_user_ids)} blogger(s) in batch...")
+        print(f"  Strategy: Fetch latest notes, MediaCrawler will skip already collected notes at source")
+        print(f"  Batch size: {batch_size} blogger(s) per batch")
+        success = _run_mediacrawler_with_exclude_filter(qualified_user_ids, max_notes, exclude_note_ids_map, batch_size)
 
         if not success:
             print(f"✗ MediaCrawler batch run failed")
-            # Mark all as failed
+            # Mark all as partial (not failed, so they can be resumed)
             for blogger in qualified_bloggers:
-                BloggerDB.update_status(blogger["user_id"], "error")
+                progress = BloggerDB.get_scrape_progress(blogger['user_id'])
+                BloggerDB.update_scrape_progress(
+                    user_id=blogger["user_id"],
+                    notes_collected=progress['notes_collected'],
+                    notes_target=max_notes,
+                    scrape_status='partial',
+                    failure_reason='MediaCrawler batch failed'
+                )
                 stats["failed"] += 1
             return stats
 
@@ -638,17 +821,34 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
             user_id = blogger["user_id"]
             nickname = blogger["nickname"]
 
-            print(f"\n🔄 [{idx}/{len(qualified_bloggers)}] Processing: {nickname}")
+            # Check progress
+            progress = BloggerDB.get_scrape_progress(user_id)
+            notes_collected = progress['notes_collected']
+            is_resuming = progress['scrape_status'] == 'partial'
 
-            # Check if we have notes for this user
+            if notes_collected >= max_notes:
+                print(f"\n✓ [{idx}/{len(qualified_bloggers)}] Skipped: {nickname} - Already completed ({notes_collected}/{max_notes} notes)")
+                BloggerDB.update_scrape_progress(user_id, notes_collected, max_notes, 'completed')
+                continue
+
+            if is_resuming:
+                print(f"\n🔄 [{idx}/{len(qualified_bloggers)}] Resuming: {nickname} ({notes_collected}/{max_notes} notes)")
+                stats["resumed"] += 1
+            else:
+                print(f"\n🔄 [{idx}/{len(qualified_bloggers)}] Processing: {nickname}")
+
+            # Mark as in progress
+            BloggerDB.update_scrape_progress(user_id, notes_collected, max_notes, 'in_progress')
+
+            # Check if we have notes for this user in JSON
             if user_id not in notes_by_user:
                 print(f"  ⚠ No notes found for this user in JSON")
-                BloggerDB.update_status(user_id, "error")
+                BloggerDB.update_scrape_progress(user_id, notes_collected, max_notes, 'partial', 'No notes in JSON')
                 stats["failed"] += 1
                 continue
 
             user_notes = notes_by_user[user_id]
-            print(f"  ✓ Found {len(user_notes)} note(s)")
+            print(f"  ✓ Found {len(user_notes)} new note(s) from MediaCrawler (duplicates already filtered at source)")
 
             # Save notes to database
             notes_added = 0
@@ -672,11 +872,31 @@ def scrape_pending_bloggers(limit: int = 5, use_existing_data: bool = True, max_
                 except Exception as e:
                     print(f"    ⚠ Failed to save note {note['note_id']}: {e}")
 
-            print(f"  ✓ Saved {notes_added}/{len(user_notes)} notes to database")
+            # Count actual notes in database
+            total_collected = NoteDB.count_notes_by_user(user_id)
+            print(f"  ✓ Saved {notes_added}/{len(user_notes)} notes (Total in DB: {total_collected})")
 
-            # Update blogger status
-            BloggerDB.update_status(user_id, "scraped")
-            stats["scraped"] += 1
+            # Update progress and status
+            # Important: If we got fewer notes than requested, it means the blogger has no more notes
+            remaining_needed = max_notes - notes_collected
+            if total_collected >= max_notes:
+                # Reached or exceeded target
+                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
+                BloggerDB.update_status(user_id, "scraped")
+                print(f"  ✓ Status: completed")
+                stats["scraped"] += 1
+            elif len(user_notes) < remaining_needed:
+                # Got fewer notes than expected, meaning blogger has no more notes
+                # Adjust target to actual collected amount and mark as completed
+                BloggerDB.update_scrape_progress(user_id, total_collected, total_collected, 'completed')
+                BloggerDB.update_status(user_id, "scraped")
+                print(f"  ✓ Status: completed (blogger has only {total_collected} notes total, adjusted target)")
+                stats["scraped"] += 1
+            else:
+                # Still have more notes to collect
+                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'partial')
+                print(f"  ⚠ Status: partial ({total_collected}/{max_notes} notes)")
+
             stats["notes_added"] += notes_added
 
             # Delay between bloggers
@@ -805,6 +1025,251 @@ def clean_all_data(json_dir: Optional[Path] = None) -> Dict[str, int]:
     print(f"  Files processed: {stats['files']}")
     print(f"  Bloggers saved: {stats['bloggers']}")
     print(f"  Notes saved: {stats['notes']}")
+    print(f"{'='*60}\n")
+
+    return stats
+
+
+def scrape_specific_bloggers(
+    user_ids: List[str],
+    max_notes: int = 100,
+    batch_size: int = 5
+) -> Dict[str, int]:
+    """
+    为指定的博主列表采集笔记（带智能过滤，排除已采集笔记）
+
+    专门用于恢复采集模式，只采集缺失的笔记，避免重复采集
+
+    Args:
+        user_ids: 要采集的博主 ID 列表
+        max_notes: 每个博主的目标笔记数量（默认: 100）
+        batch_size: 批处理大小（默认: 5）
+
+    Returns:
+        统计信息字典: {"scraped": int, "failed": int, "notes_added": int, "resumed": int}
+    """
+    init_db()
+
+    print(f"\n{'='*60}")
+    print(f"RedLens Specific Bloggers Scraping (Resume Mode)")
+    print(f"{'='*60}")
+    print(f"Target bloggers: {len(user_ids)}")
+    print(f"Max notes per blogger: {max_notes}")
+    print(f"Batch size: {batch_size}")
+    print(f"{'='*60}\n")
+
+    stats = {
+        "scraped": 0,
+        "failed": 0,
+        "notes_added": 0,
+        "resumed": len(user_ids)
+    }
+
+    # Get blogger information
+    target_bloggers = []
+    for user_id in user_ids:
+        blogger = BloggerDB.get_blogger(user_id)
+        if blogger:
+            target_bloggers.append(blogger)
+        else:
+            print(f"⚠ Warning: Blogger {user_id} not found in database")
+            stats["failed"] += 1
+
+    if not target_bloggers:
+        print("✗ No valid bloggers to process")
+        return stats
+
+    print(f"📋 Processing {len(target_bloggers)} blogger(s):")
+    for blogger in target_bloggers:
+        progress = BloggerDB.get_scrape_progress(blogger['user_id'])
+        print(f"  • {blogger['nickname']} ({progress['notes_collected']}/{max_notes} notes)")
+
+    # Mark all bloggers as in_progress BEFORE starting MediaCrawler
+    # print(f"\n📝 Marking {len(target_bloggers)} blogger(s) as in_progress...")
+
+    # Build exclude note IDs map for smart filtering
+    # Calculate the maximum remaining notes needed
+    max_remaining_notes = 0
+    exclude_note_ids_map = {}
+
+    for blogger in target_bloggers:
+        user_id = blogger["user_id"]
+        progress = BloggerDB.get_scrape_progress(user_id)
+        notes_collected = progress['notes_collected']
+
+        # Calculate remaining notes needed for this blogger
+        remaining_notes = max(0, max_notes - notes_collected)
+        max_remaining_notes = max(max_remaining_notes, remaining_notes)
+
+        # Get existing note IDs for this user
+        existing_note_ids = NoteDB.get_note_ids_by_user(user_id)
+
+        if existing_note_ids:
+            exclude_note_ids_map[user_id] = existing_note_ids
+            print(f"  • {blogger['nickname']}: {len(existing_note_ids)} existing notes to exclude, needs {remaining_notes} more")
+        else:
+            print(f"  • {blogger['nickname']}: needs {remaining_notes} notes")
+
+        BloggerDB.update_scrape_progress(
+            user_id=user_id,
+            notes_collected=progress['notes_collected'],
+            notes_target=max_notes,
+            scrape_status='in_progress'
+        )
+
+    # Use the maximum remaining notes for MediaCrawler
+    # This ensures we fetch enough for the blogger who needs the most
+    if max_remaining_notes == 0:
+        print(f"\n✓ All bloggers have reached their target, no need to crawl")
+        return stats
+
+    print(f"\n💡 Will fetch up to {max_remaining_notes} new notes per blogger")
+    # print(f"✓ All bloggers marked as in_progress\n")
+
+    # Configure MediaCrawler to exclude already collected notes
+    if exclude_note_ids_map:
+        print(f"📋 Smart filtering enabled: excluding {sum(len(ids) for ids in exclude_note_ids_map.values())} existing notes across {len(exclude_note_ids_map)} blogger(s)\n")
+
+    print(f"🔍 Running MediaCrawler for {len(target_bloggers)} blogger(s) in batch...")
+    print(f"  Strategy: Fetch latest notes, MediaCrawler will skip already collected notes at source")
+    print(f"  Batch size: {batch_size} blogger(s) per batch")
+
+    # Use max_remaining_notes instead of max_notes to avoid over-fetching
+    success = _run_mediacrawler_with_exclude_filter(user_ids, max_remaining_notes, exclude_note_ids_map, batch_size)
+
+    if not success:
+        print(f"✗ MediaCrawler batch run failed")
+        # Mark all as partial (not failed, so they can be resumed)
+        for blogger in target_bloggers:
+            progress = BloggerDB.get_scrape_progress(blogger['user_id'])
+            BloggerDB.update_scrape_progress(
+                user_id=blogger["user_id"],
+                notes_collected=progress['notes_collected'],
+                notes_target=max_notes,
+                scrape_status='partial',
+                failure_reason='MediaCrawler batch failed'
+            )
+            stats["failed"] += 1
+        return stats
+
+    # Load the newly generated data
+    json_dir = MEDIA_CRAWLER_ROOT / "data" / "xhs" / "json"
+
+    # Look for creator content files (MediaCrawler saves creator posts separately)
+    creator_files = list(json_dir.glob("creator_contents_*.json"))
+    if creator_files:
+        latest_file = max(creator_files, key=lambda p: p.stat().st_mtime)
+    else:
+        # Fallback to search contents
+        search_files = list(json_dir.glob("search_contents_*.json"))
+        if search_files:
+            latest_file = max(search_files, key=lambda p: p.stat().st_mtime)
+        else:
+            print(f"✗ No data files found after scraping")
+            for blogger in target_bloggers:
+                progress = BloggerDB.get_scrape_progress(blogger['user_id'])
+                BloggerDB.update_scrape_progress(
+                    blogger["user_id"],
+                    progress['notes_collected'],
+                    max_notes,
+                    'partial',
+                    'No result file'
+                )
+                stats["failed"] += 1
+            return stats
+
+    print(f"\n📂 Loading data from: {latest_file.name}")
+    all_notes = load_notes_from_json(latest_file)
+    print(f"✓ Loaded {len(all_notes)} total notes from JSON")
+
+    # Group notes by user_id
+    notes_by_user = {}
+    for note in all_notes:
+        note_user_id = note["user_id"]
+        if note_user_id in user_ids:
+            if note_user_id not in notes_by_user:
+                notes_by_user[note_user_id] = []
+            notes_by_user[note_user_id].append(note)
+
+    print(f"\n{'='*60}")
+    print(f"Processing notes for each blogger")
+    print(f"{'='*60}\n")
+
+    # Process each blogger
+    for idx, blogger in enumerate(target_bloggers, 1):
+        user_id = blogger["user_id"]
+        nickname = blogger["nickname"]
+
+        # Check progress
+        progress = BloggerDB.get_scrape_progress(user_id)
+        notes_collected = progress['notes_collected']
+
+        print(f"🔄 [{idx}/{len(target_bloggers)}] {nickname} (Previously: {notes_collected} notes)")
+
+        # Check if we have notes for this user in JSON
+        if user_id not in notes_by_user:
+            print(f"  ⚠ No new notes found in JSON")
+            BloggerDB.update_scrape_progress(user_id, notes_collected, max_notes, 'partial', 'No notes in JSON')
+            stats["failed"] += 1
+            continue
+
+        user_notes = notes_by_user[user_id]
+        print(f"  ✓ Found {len(user_notes)} new note(s) from MediaCrawler")
+
+        # Save notes to database
+        notes_added = 0
+        for note in user_notes:
+            try:
+                success = NoteDB.insert_note(
+                    note_id=note["note_id"],
+                    user_id=note["user_id"],
+                    title=note["title"],
+                    desc=note["desc"],
+                    note_type=note["type"],
+                    likes=note["likes"],
+                    collects=note["collects"],
+                    comments=note["comments"],
+                    create_time=note["create_time"],
+                    cover_url=note["cover_url"],
+                    note_url=note.get("note_url", "")
+                )
+                if success:
+                    notes_added += 1
+            except Exception as e:
+                print(f"    ⚠ Failed to save note {note['note_id']}: {e}")
+
+        # Count actual notes in database
+        total_collected = NoteDB.count_notes_by_user(user_id)
+        print(f"  ✓ Saved {notes_added} new notes (Total in DB: {total_collected})")
+
+        # Update progress and status
+        if total_collected >= max_notes:
+            # Reached or exceeded target
+            BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
+            BloggerDB.update_status(user_id, "scraped")
+            print(f"  ✓ Status: completed (reached target)")
+            stats["scraped"] += 1
+        else:
+            # Still need more notes OR no more notes available from blogger
+            if len(user_notes) == 0:
+                # No new notes means blogger has no more notes to offer
+                BloggerDB.update_scrape_progress(user_id, total_collected, total_collected, 'completed')
+                BloggerDB.update_status(user_id, "scraped")
+                print(f"  ✓ Status: completed (blogger has only {total_collected} notes total)")
+                stats["scraped"] += 1
+            else:
+                # Got some notes but not enough
+                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'partial')
+                print(f"  ⚠ Status: partial ({total_collected}/{max_notes} notes)")
+
+        stats["notes_added"] += notes_added
+
+    print(f"\n{'='*60}")
+    print(f"✓ Scraping completed!")
+    print(f"  Bloggers processed: {len(target_bloggers)}")
+    print(f"  Successfully completed: {stats['scraped']}")
+    print(f"  Failed/Partial: {stats['failed']}")
+    print(f"  Total new notes added: {stats['notes_added']}")
     print(f"{'='*60}\n")
 
     return stats

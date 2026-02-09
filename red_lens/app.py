@@ -99,243 +99,209 @@ def main():
         # Section 2: Scraping
         st.subheader("📥 数据采集")
 
-        # Get all pending bloggers to extract unique keywords
-        all_pending = BloggerDB.get_pending_bloggers(limit=1000)  # Get all pending
-        pending_keywords = set()
-        for blogger in all_pending:
-            if blogger.get("source_keyword"):
-                pending_keywords.add(blogger["source_keyword"])
+        # Check for resumable bloggers
+        resumable_count = BloggerDB.count_resumable_bloggers()
+        pending_count = BloggerDB.count_by_status("pending")
 
-        # Keyword filter
-        keyword_filter_options = ["全部关键词"] + sorted(list(pending_keywords))
-        selected_scrape_keyword = st.selectbox(
-            "筛选待采集博主",
-            options=keyword_filter_options,
-            help="按来源关键词筛选要采集的博主"
+        # Display status
+        col_status1, col_status2 = st.columns(2)
+        with col_status1:
+            st.metric("待采集博主", pending_count)
+        with col_status2:
+            st.metric("可恢复采集", resumable_count)
+
+        # Mode selection
+        collection_mode = st.radio(
+            "采集模式",
+            options=["正常采集", "恢复采集"],
+            help="正常采集：采集新的待处理博主｜恢复采集：继续未完成的采集任务",
+            horizontal=True
         )
 
-        # Count pending bloggers based on filter
-        if selected_scrape_keyword == "全部关键词":
-            pending_count = BloggerDB.count_by_status("pending")
-            filter_keyword = None
-        else:
-            pending_count = BloggerDB.count_pending_by_keyword(selected_scrape_keyword)
-            filter_keyword = selected_scrape_keyword
+        st.markdown("---")
 
-        st.info(f"待采集博主: {pending_count} 位")
+        # Mode 1: Normal Collection
+        if collection_mode == "正常采集":
+            st.subheader("📊 正常采集模式")
 
-        scrape_limit = st.number_input(
-            "采集博主数量",
-            min_value=1,
-            max_value=20,
-            value=min(5, pending_count) if pending_count > 0 else 5,
-            help="每次采集的博主数量"
-        )
-
-        max_notes_per_blogger = st.slider(
-            "每个博主爬取笔记数量",
-            min_value=10,
-            max_value=200,
-            value=100,
-            step=10,
-            help="每个博主最多爬取的笔记数量（默认100条）"
-        )
-
-        # Advanced settings
-        with st.expander("⚙️ 高级设置", expanded=False):
-            # Fans filter
-            enable_fans_filter = st.checkbox(
-                "启用粉丝数过滤",
-                value=False,
-                help="采集前检查博主粉丝数，跳过粉丝数低于阈值的博主"
-            )
-
-            min_fans = 0
-            if enable_fans_filter:
-                min_fans = st.number_input(
-                    "最低粉丝数阈值",
-                    min_value=0,
-                    max_value=1000000,
-                    value=1000,
-                    step=1000,
-                    help="粉丝数低于此值的博主将被跳过，不采集其笔记"
-                )
-
-            st.markdown("---")
-
-            # Batch size
-            batch_size = st.number_input(
-                "批量大小",
-                min_value=1,
-                max_value=20,
-                value=5,
-                step=1,
-                help="每批处理的博主数量。数量越小越稳定，但总耗时越长。推荐5个。"
-            )
-            st.caption("💡 批量处理说明：")
-            st.caption("- 博主数量 ≤ 批量大小：一次性处理")
-            st.caption("- 博主数量 > 批量大小：自动分批处理")
-            st.caption("- 预计时间 ≈ 批次数 × (批量大小 × 笔记数 × 4秒)")
-
-        if st.button("📊 开始采集数据", use_container_width=True):
             if pending_count == 0:
                 st.warning("没有待采集的博主")
             else:
-                # Get filtered pending bloggers
-                if filter_keyword:
-                    target_bloggers = BloggerDB.get_pending_bloggers_by_keyword(
-                        keyword=filter_keyword,
-                        limit=scrape_limit
+                # Get all pending bloggers to extract unique keywords
+                all_pending = BloggerDB.get_pending_bloggers(limit=1000)
+                pending_keywords = set()
+                for blogger in all_pending:
+                    if blogger.get("source_keyword"):
+                        pending_keywords.add(blogger["source_keyword"])
+
+                # Keyword filter
+                keyword_filter_options = ["全部关键词"] + sorted(list(pending_keywords))
+                selected_scrape_keyword = st.selectbox(
+                    "筛选待采集博主",
+                    options=keyword_filter_options,
+                    help="按来源关键词筛选要采集的博主"
+                )
+
+                # Count pending bloggers based on filter
+                if selected_scrape_keyword == "全部关键词":
+                    filtered_pending_count = pending_count
+                    filter_keyword = None
+                else:
+                    filtered_pending_count = BloggerDB.count_pending_by_keyword(selected_scrape_keyword)
+                    filter_keyword = selected_scrape_keyword
+
+                st.info(f"符合条件的待采集博主: {filtered_pending_count} 位")
+
+                scrape_limit = st.number_input(
+                    "采集博主数量",
+                    min_value=1,
+                    max_value=20,
+                    value=min(5, filtered_pending_count) if filtered_pending_count > 0 else 5,
+                    help="每次采集的博主数量"
+                )
+
+                max_notes_per_blogger = st.slider(
+                    "每个博主爬取笔记数量",
+                    min_value=10,
+                    max_value=200,
+                    value=100,
+                    step=10,
+                    help="每个博主最多爬取的笔记数量（默认100条）"
+                )
+
+                # Advanced settings
+                with st.expander("⚙️ 高级设置", expanded=False):
+                    # Fans filter
+                    enable_fans_filter = st.checkbox(
+                        "启用粉丝数过滤",
+                        value=False,
+                        help="采集前检查博主粉丝数，跳过粉丝数低于阈值的博主"
                     )
-                else:
-                    target_bloggers = BloggerDB.get_pending_bloggers(limit=scrape_limit)
 
-                if not target_bloggers:
-                    st.warning("没有符合条件的待采集博主")
-                else:
-                    # Show which bloggers will be scraped
-                    with st.expander("📋 将要采集的博主", expanded=False):
-                        for blogger in target_bloggers:
-                            st.markdown(f"- {blogger['nickname']} ({blogger.get('source_keyword', 'N/A')})")
-
-                    with st.spinner(f"正在采集数据（每位博主最多{max_notes_per_blogger}条笔记）..."):
-                        from red_lens.pipeline import (
-                            fetch_creators_fans_batch,
-                            run_mediacrawler_for_creators_batch,
-                            load_notes_from_json
+                    min_fans = 0
+                    if enable_fans_filter:
+                        min_fans = st.number_input(
+                            "最低粉丝数阈值",
+                            min_value=0,
+                            max_value=1000000,
+                            value=1000,
+                            step=1000,
+                            help="粉丝数低于此值的博主将被跳过，不采集其笔记"
                         )
 
-                        stats = {"scraped": 0, "failed": 0, "notes_added": 0, "skipped_low_fans": 0}
+                    st.markdown("---")
 
-                        # Phase 1: Batch filter by fans count (if enabled)
-                        qualified_bloggers = []
+                    # Batch size
+                    batch_size = st.number_input(
+                        "批量大小",
+                        min_value=1,
+                        max_value=20,
+                        value=5,
+                        step=1,
+                        help="每批处理的博主数量。数量越小越稳定，但总耗时越长。推荐5个。"
+                    )
+                    st.caption("💡 批量处理说明：")
+                    st.caption("- 博主数量 ≤ 批量大小：一次性处理")
+                    st.caption("- 博主数量 > 批量大小：自动分批处理")
+                    st.caption("- 预计时间 ≈ 批次数 × (批量大小 × 笔记数 × 4秒)")
 
-                        if min_fans > 0:
-                            st.text(f"📊 Phase 1: 批量获取粉丝数...")
-                            st.text(f"   正在获取 {len(target_bloggers)} 位博主的粉丝数...")
+                if st.button("📊 开始正常采集", type="primary", use_container_width=True):
+                    if filtered_pending_count == 0:
+                        st.warning("没有符合条件的待采集博主")
+                    else:
+                        # Normal collection - no resume
+                        with st.spinner(f"正在采集数据（每位博主最多{max_notes_per_blogger}条笔记）..."):
+                            stats = scrape_pending_bloggers(
+                                limit=scrape_limit,
+                                use_existing_data=False,
+                                max_notes=max_notes_per_blogger,
+                                min_fans=min_fans,
+                                resume_partial=False,  # Disable resume in normal mode
+                                batch_size=batch_size
+                            )
 
-                            user_ids = [b["user_id"] for b in target_bloggers]
-                            fans_dict = fetch_creators_fans_batch(user_ids)
+                            msg = f"✓ 采集完成! 成功: {stats['scraped']}, 失败: {stats['failed']}, 笔记: {stats['notes_added']}"
+                            if stats.get('resumed', 0) > 0:
+                                msg += f", 恢复: {stats['resumed']}"
+                            if stats['skipped_low_fans'] > 0:
+                                msg += f", 粉丝数不足跳过: {stats['skipped_low_fans']}"
+                            st.success(msg)
+                            st.rerun()
 
-                            st.text(f"   ✓ 已获取粉丝数据")
-                            st.text("")
-                            st.text("📋 粉丝数筛选结果:")
+        # Mode 2: Resume Collection
+        else:
+            st.subheader("🔄 恢复采集模式")
 
-                            for blogger in target_bloggers:
-                                user_id = blogger["user_id"]
-                                nickname = blogger["nickname"]
-                                fans_count = fans_dict.get(user_id, 0)
+            if resumable_count == 0:
+                st.warning("没有可恢复的采集任务")
+                st.info("💡 提示：在正常采集过程中中断后，博主会进入可恢复状态")
+            else:
+                # Get resumable bloggers
+                resumable_bloggers = BloggerDB.get_resumable_bloggers()
 
-                                # Update fans in database
-                                BloggerDB.update_fans(user_id, current_fans=fans_count)
+                # Create blogger selection options
+                blogger_options = {}
+                for blogger in resumable_bloggers:
+                    progress = BloggerDB.get_scrape_progress(blogger['user_id'])
+                    label = f"{blogger['nickname']} ({progress['notes_collected']}/{progress['notes_target']} 笔记)"
+                    blogger_options[label] = blogger['user_id']
 
-                                if fans_count < min_fans:
-                                    st.text(f"  ⚠ 跳过: {nickname} - 粉丝 ({fans_count:,}) < 阈值 ({min_fans:,})")
-                                    BloggerDB.update_status(user_id, "error")
-                                    stats["skipped_low_fans"] += 1
-                                else:
-                                    st.text(f"  ✓ 合格: {nickname} - 粉丝 ({fans_count:,})")
-                                    qualified_bloggers.append(blogger)
+                # Multi-select for bloggers to resume
+                st.write("选择要恢复采集的博主：")
+                selected_bloggers = st.multiselect(
+                    "选择博主",
+                    options=list(blogger_options.keys()),
+                    default=list(blogger_options.keys())[:min(3, len(blogger_options))],  # Default select first 3
+                    help="可以选择多个博主同时恢复采集"
+                )
 
-                            st.text("")
-                            st.text(f"✓ Phase 1 完成: {len(qualified_bloggers)}/{len(target_bloggers)} 位博主通过筛选")
-                            st.text("")
-                        else:
-                            qualified_bloggers = target_bloggers
+                if selected_bloggers:
+                    selected_user_ids = [blogger_options[label] for label in selected_bloggers]
 
-                        # Phase 2: Batch scrape notes for qualified bloggers
-                        if not qualified_bloggers:
-                            st.warning("没有博主通过粉丝数筛选")
-                        else:
-                            st.text(f"📊 Phase 2: 批量采集笔记...")
-                            st.text(f"   正在采集 {len(qualified_bloggers)} 位博主的笔记...")
-                            st.text(f"   批量大小: {batch_size} 博主/批次")
+                    # Show selected bloggers with progress
+                    st.write(f"已选择 {len(selected_user_ids)} 位博主：")
+                    for label in selected_bloggers:
+                        st.caption(f"  • {label}")
 
-                            qualified_user_ids = [b["user_id"] for b in qualified_bloggers]
-                            success = run_mediacrawler_for_creators_batch(
-                                qualified_user_ids,
+                    max_notes_per_blogger = st.slider(
+                        "每个博主笔记目标数量",
+                        min_value=10,
+                        max_value=200,
+                        value=100,
+                        step=10,
+                        help="每个博主的目标笔记数量（会继续采集到达此数量）"
+                    )
+
+                    # Advanced settings for resume mode
+                    with st.expander("⚙️ 高级设置", expanded=False):
+                        # Batch size
+                        batch_size = st.number_input(
+                            "批量大小",
+                            min_value=1,
+                            max_value=20,
+                            value=5,
+                            step=1,
+                            help="每批处理的博主数量"
+                        )
+
+                    if st.button("🔄 开始恢复采集", type="primary", use_container_width=True):
+                        # Resume collection for selected bloggers using smart filtering
+                        with st.spinner(f"正在恢复采集 {len(selected_user_ids)} 位博主的数据..."):
+                            # Import the new function for resume mode
+                            from red_lens.pipeline import scrape_specific_bloggers
+
+                            # Use the new function with smart filtering (excludes already collected notes)
+                            stats = scrape_specific_bloggers(
+                                user_ids=selected_user_ids,
                                 max_notes=max_notes_per_blogger,
                                 batch_size=batch_size
                             )
 
-                            if success:
-                                st.text(f"   ✓ MediaCrawler 运行成功")
-
-                                # Load notes and save to database
-                                json_dir = Path(__file__).parent.parent / "data" / "xhs" / "json"
-                                creator_files = list(json_dir.glob("creator_contents_*.json"))
-
-                                if creator_files:
-                                    latest_file = max(creator_files, key=lambda p: p.stat().st_mtime)
-                                    all_notes = load_notes_from_json(latest_file)
-
-                                    # Group notes by user_id
-                                    notes_by_user = {}
-                                    for note in all_notes:
-                                        user_id = note["user_id"]
-                                        if user_id in qualified_user_ids:
-                                            if user_id not in notes_by_user:
-                                                notes_by_user[user_id] = []
-                                            notes_by_user[user_id].append(note)
-
-                                    st.text("")
-                                    st.text("📝 保存笔记到数据库:")
-
-                                    for blogger in qualified_bloggers:
-                                        user_id = blogger["user_id"]
-                                        nickname = blogger["nickname"]
-
-                                        if user_id in notes_by_user:
-                                            user_notes = notes_by_user[user_id]
-                                            notes_added = 0
-
-                                            for note in user_notes:
-                                                try:
-                                                    NoteDB.insert_note(
-                                                        note_id=note["note_id"],
-                                                        user_id=note["user_id"],
-                                                        title=note["title"],
-                                                        desc=note["desc"],
-                                                        note_type=note["type"],
-                                                        likes=note["likes"],
-                                                        collects=note["collects"],
-                                                        comments=note["comments"],
-                                                        create_time=note["create_time"],
-                                                        cover_url=note["cover_url"],
-                                                        note_url=note.get("note_url", "")
-                                                    )
-                                                    notes_added += 1
-                                                except Exception:
-                                                    pass
-
-                                            BloggerDB.update_status(user_id, "scraped")
-                                            stats["scraped"] += 1
-                                            stats["notes_added"] += notes_added
-                                            st.text(f"  ✓ {nickname}: {notes_added} 条笔记")
-                                        else:
-                                            BloggerDB.update_status(user_id, "error")
-                                            stats["failed"] += 1
-                                            st.text(f"  ⚠ {nickname}: 未找到笔记")
-
-                                    st.text("")
-                                    st.text(f"✓ Phase 2 完成")
-                                else:
-                                    st.error("未找到采集结果文件")
-                                    for blogger in qualified_bloggers:
-                                        BloggerDB.update_status(blogger["user_id"], "error")
-                                        stats["failed"] += 1
-                            else:
-                                st.error("MediaCrawler 运行失败")
-                                for blogger in qualified_bloggers:
-                                    BloggerDB.update_status(blogger["user_id"], "error")
-                                    stats["failed"] += 1
-
-
-                        msg = f"✓ 采集完成! 成功: {stats['scraped']}, 失败: {stats['failed']}, 笔记: {stats['notes_added']}"
-                        if stats['skipped_low_fans'] > 0:
-                            msg += f", 粉丝数不足跳过: {stats['skipped_low_fans']}"
-                        st.success(msg)
-                        st.rerun()
+                            msg = f"✓ 恢复采集完成! 已恢复: {stats['resumed']}, 成功: {stats['scraped']}, 失败: {stats['failed']}, 新增笔记: {stats['notes_added']}"
+                            st.success(msg)
+                            st.rerun()
+                else:
+                    st.info("请选择至少一个博主进行恢复采集")
 
         st.markdown("---")
 
@@ -747,10 +713,67 @@ def show_detailed_analysis():
     st.markdown("---")
     st.subheader("🤖 AI 洞察报告")
 
-    if st.button("生成 AI 报告", type="primary"):
-        with st.spinner("AI 正在分析..."):
-            report = generate_ai_report(selected_user_id, use_mock=True)
-            st.markdown(report)
+    # Import report functions
+    from red_lens.analyzer import report_exists, load_report_from_file, delete_report_file, generate_ai_report
+    import config
+
+    # Check if report exists
+    has_report = report_exists(selected_user_id)
+
+    # Configuration controls
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        use_real_api = st.checkbox(
+            "使用真实 Deepseek API",
+            value=config.ENABLE_REAL_AI,
+            help="需要配置 DEEPSEEK_API_KEY 环境变量"
+        )
+    with col2:
+        # Show report status
+        if has_report:
+            st.info("✓ 已有报告")
+        else:
+            st.caption("无报告")
+    with col3:
+        if has_report and st.button("🗑️ 删除报告", help="删除当前博主的AI报告"):
+            if delete_report_file(selected_user_id):
+                st.success("报告已删除")
+                st.rerun()
+
+    # Display existing report if available
+    if has_report:
+        existing_report = load_report_from_file(selected_user_id)
+        if existing_report:
+            st.markdown(existing_report)
+            st.markdown("---")
+
+    # Generate/Regenerate button
+    col_btn1, col_btn2 = st.columns([1, 3])
+    with col_btn1:
+        if has_report:
+            generate_btn = st.button("🔄 重新生成报告", type="secondary", use_container_width=True)
+        else:
+            generate_btn = st.button("✨ 生成 AI 报告", type="primary", use_container_width=True)
+    with col_btn2:
+        if use_real_api:
+            st.caption("💡 使用真实 API 生成报告")
+        else:
+            st.caption("💡 使用 Mock 报告（测试模式）")
+
+    if generate_btn:
+        use_mock = not use_real_api
+        force_regenerate = has_report  # If report exists, force regenerate
+        spinner_text = "AI 正在分析..." if use_real_api else "生成模拟报告..."
+        with st.spinner(spinner_text):
+            try:
+                report = generate_ai_report(selected_user_id, use_mock=use_mock, force_regenerate=force_regenerate)
+                if report.startswith("Error:"):
+                    st.error(report)
+                else:
+                    st.success("✓ 报告生成成功！")
+                    st.rerun()  # Reload to display the new report
+            except Exception as e:
+                st.error(f"生成报告失败: {str(e)}")
 
     # Top notes
     st.markdown("---")
@@ -879,7 +902,7 @@ def show_blogger_management():
 
     # Create a table-like display with checkboxes
     for idx, blogger in enumerate(filtered_bloggers):
-        col1, col2, col3, col4, col5, col6 = st.columns([0.5, 2, 1.5, 1, 1, 1])
+        col1, col2, col3, col4, col5, col6, col7 = st.columns([0.5, 2, 1.5, 1, 1, 1, 1.2])
 
         with col1:
             is_selected = blogger["user_id"] in st.session_state.selected_bloggers
@@ -911,6 +934,15 @@ def show_blogger_management():
             # Get note count
             note_count = NoteDB.count_notes_by_user(blogger["user_id"])
             st.caption(f"📝 {note_count} 笔记")
+
+        with col7:
+            # Show scrape progress
+            progress = BloggerDB.get_scrape_progress(blogger["user_id"])
+            if progress['notes_collected'] > 0 or progress['scrape_status'] != 'not_started':
+                progress_pct = min(progress['notes_collected'] / max(progress['notes_target'], 1), 1.0)
+                st.progress(progress_pct, text=f"{progress['notes_collected']}/{progress['notes_target']}")
+            else:
+                st.caption("未开始")
 
     st.markdown("---")
 

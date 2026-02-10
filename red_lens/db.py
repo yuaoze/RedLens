@@ -289,6 +289,49 @@ class BloggerDB:
             return False
 
     @staticmethod
+    def update_blogger_info(
+        user_id: str,
+        nickname: str = None,
+        avatar_url: str = None,
+        current_fans: int = None
+    ) -> bool:
+        """Update blogger nickname, avatar, or fans"""
+        try:
+            with get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Build update query with only provided fields
+                update_fields = []
+                values = []
+
+                if nickname is not None:
+                    update_fields.append("nickname = ?")
+                    values.append(nickname)
+                if avatar_url is not None:
+                    update_fields.append("avatar_url = ?")
+                    values.append(avatar_url)
+                if current_fans is not None:
+                    update_fields.append("current_fans = ?")
+                    values.append(current_fans)
+
+                if not update_fields:
+                    return False
+
+                update_fields.append("last_update = CURRENT_TIMESTAMP")
+                values.append(user_id)
+
+                query = f"""
+                    UPDATE bloggers
+                    SET {', '.join(update_fields)}
+                    WHERE user_id = ?
+                """
+                cursor.execute(query, values)
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error updating blogger info for {user_id}: {e}")
+            return False
+
+    @staticmethod
     def get_all_bloggers() -> List[Dict[str, Any]]:
         """Get all bloggers"""
         with get_connection() as conn:

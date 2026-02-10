@@ -19,7 +19,7 @@ from datetime import datetime
 
 from red_lens.db import BloggerDB, NoteDB, init_db
 from red_lens.discovery import search_and_extract_users
-from red_lens.pipeline import scrape_pending_bloggers
+from red_lens.pipeline import scrape_pending_bloggers, collect_blogger_by_manual_id
 from red_lens.analyzer import (
     analyze_blogger,
     analyze_all_bloggers,
@@ -305,6 +305,64 @@ def main():
 
         st.markdown("---")
 
+        # Section 2.5: Manual Collection
+        st.subheader("📝 手动采集博主")
+
+        manual_user_id = st.text_input(
+            "博主ID",
+            placeholder="输入小红书博主ID (例如: 5c3a10f80000000007024ac5)",
+            help="输入小红书博主的user_id，可以从博主主页URL中获取"
+        )
+
+        manual_nickname = st.text_input(
+            "博主昵称（可选）",
+            placeholder="例如: 某摄影师",
+            help="选填，便于在数据库中识别该博主"
+        )
+
+        manual_max_notes = st.slider(
+            "采集笔记数量",
+            min_value=10,
+            max_value=200,
+            value=100,
+            step=10,
+            help="要采集的笔记数量"
+        )
+
+        manual_add_to_db = st.checkbox(
+            "添加到数据库",
+            value=True,
+            help="勾选后会将博主信息保存到数据库，可在博主管理中查看和管理"
+        )
+
+        if st.button("🚀 开始手动采集", type="primary", use_container_width=True):
+            if not manual_user_id or not manual_user_id.strip():
+                st.error("请输入博主ID")
+            else:
+                user_id_clean = manual_user_id.strip()
+
+                with st.spinner(f"正在采集博主 {user_id_clean} 的笔记..."):
+                    result = collect_blogger_by_manual_id(
+                        user_id=user_id_clean,
+                        max_notes=manual_max_notes,
+                        add_to_db=manual_add_to_db,
+                        nickname=manual_nickname.strip() if manual_nickname else None
+                    )
+
+                    if result["success"]:
+                        if "message" in result:
+                            st.info(result["message"])
+                        else:
+                            st.success(
+                                f"✓ 采集完成! 博主: {user_id_clean}\n"
+                                f"总笔记数: {result['notes_count']}"
+                            )
+                        st.rerun()
+                    else:
+                        st.error(f"❌ 采集失败: {result.get('error', 'Unknown error')}")
+
+        st.markdown("---")
+
         # Section 3: Analysis
         st.subheader("🔬 数据分析")
 
@@ -571,11 +629,17 @@ def show_detailed_analysis():
     """Display detailed analysis for selected blogger"""
     st.header("📈 博主详细分析")
 
-    # Get all scraped bloggers
-    scraped_bloggers = [b for b in BloggerDB.get_all_bloggers() if b["status"] == "scraped"]
+    # Get all scraped bloggers with at least 20 notes
+    all_bloggers = BloggerDB.get_all_bloggers()
+    scraped_bloggers = []
+    for b in all_bloggers:
+        if b["status"] == "scraped":
+            note_count = NoteDB.count_notes_by_user(b["user_id"])
+            if note_count >= 20:
+                scraped_bloggers.append(b)
 
     if not scraped_bloggers:
-        st.info("暂无已采集的博主数据。")
+        st.info("暂无可分析的博主数据。（需要至少20篇笔记）")
         return
 
     # Blogger selection

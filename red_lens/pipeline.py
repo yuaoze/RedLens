@@ -704,25 +704,11 @@ def scrape_pending_bloggers(
             print(f"  ✓ Saved {notes_added}/{len(user_notes)} notes (Total in DB: {total_collected})")
 
             # Update progress and status
-            # Important: If we got fewer notes than requested, it means the blogger has no more notes
-            remaining_needed = max_notes - notes_collected
-            if total_collected >= max_notes:
-                # Reached or exceeded target
-                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
-                BloggerDB.update_status(user_id, "scraped")
-                print(f"  ✓ Status: completed")
-                stats["scraped"] += 1
-            elif len(user_notes) < remaining_needed:
-                # Got fewer notes than expected, meaning blogger has no more notes
-                # Adjust target to actual collected amount and mark as completed
-                BloggerDB.update_scrape_progress(user_id, total_collected, total_collected, 'completed')
-                BloggerDB.update_status(user_id, "scraped")
-                print(f"  ✓ Status: completed (blogger has only {total_collected} notes total, adjusted target)")
-                stats["scraped"] += 1
-            else:
-                # Still have more notes to collect
-                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'partial')
-                print(f"  ⚠ Status: partial ({total_collected}/{max_notes} notes)")
+            # As long as MediaCrawler succeeded, mark as completed
+            BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
+            BloggerDB.update_status(user_id, "scraped")
+            print(f"  ✓ Status: completed (collected {total_collected} notes)")
+            stats["scraped"] += 1
 
             stats["notes_added"] += notes_added
 
@@ -778,7 +764,7 @@ def scrape_pending_bloggers(
                     user_id=blogger["user_id"],
                     notes_collected=progress['notes_collected'],
                     notes_target=max_notes,
-                    scrape_status='partial',
+                    scrape_status='failed',
                     failure_reason='MediaCrawler batch failed'
                 )
                 stats["failed"] += 1
@@ -877,25 +863,11 @@ def scrape_pending_bloggers(
             print(f"  ✓ Saved {notes_added}/{len(user_notes)} notes (Total in DB: {total_collected})")
 
             # Update progress and status
-            # Important: If we got fewer notes than requested, it means the blogger has no more notes
-            remaining_needed = max_notes - notes_collected
-            if total_collected >= max_notes:
-                # Reached or exceeded target
-                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
-                BloggerDB.update_status(user_id, "scraped")
-                print(f"  ✓ Status: completed")
-                stats["scraped"] += 1
-            elif len(user_notes) < remaining_needed:
-                # Got fewer notes than expected, meaning blogger has no more notes
-                # Adjust target to actual collected amount and mark as completed
-                BloggerDB.update_scrape_progress(user_id, total_collected, total_collected, 'completed')
-                BloggerDB.update_status(user_id, "scraped")
-                print(f"  ✓ Status: completed (blogger has only {total_collected} notes total, adjusted target)")
-                stats["scraped"] += 1
-            else:
-                # Still have more notes to collect
-                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'partial')
-                print(f"  ⚠ Status: partial ({total_collected}/{max_notes} notes)")
+            # As long as MediaCrawler succeeded, mark as completed
+            BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
+            BloggerDB.update_status(user_id, "scraped")
+            print(f"  ✓ Status: completed (collected {total_collected} notes)")
+            stats["scraped"] += 1
 
             stats["notes_added"] += notes_added
 
@@ -1139,14 +1111,14 @@ def scrape_specific_bloggers(
 
     if not success:
         print(f"✗ MediaCrawler batch run failed")
-        # Mark all as partial (not failed, so they can be resumed)
+        # Mark all as failed
         for blogger in target_bloggers:
             progress = BloggerDB.get_scrape_progress(blogger['user_id'])
             BloggerDB.update_scrape_progress(
                 user_id=blogger["user_id"],
                 notes_collected=progress['notes_collected'],
                 notes_target=max_notes,
-                scrape_status='partial',
+                scrape_status='failed',
                 failure_reason='MediaCrawler batch failed'
             )
             stats["failed"] += 1
@@ -1243,24 +1215,11 @@ def scrape_specific_bloggers(
         print(f"  ✓ Saved {notes_added} new notes (Total in DB: {total_collected})")
 
         # Update progress and status
-        if total_collected >= max_notes:
-            # Reached or exceeded target
-            BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
-            BloggerDB.update_status(user_id, "scraped")
-            print(f"  ✓ Status: completed (reached target)")
-            stats["scraped"] += 1
-        else:
-            # Still need more notes OR no more notes available from blogger
-            if len(user_notes) == 0:
-                # No new notes means blogger has no more notes to offer
-                BloggerDB.update_scrape_progress(user_id, total_collected, total_collected, 'completed')
-                BloggerDB.update_status(user_id, "scraped")
-                print(f"  ✓ Status: completed (blogger has only {total_collected} notes total)")
-                stats["scraped"] += 1
-            else:
-                # Got some notes but not enough
-                BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'partial')
-                print(f"  ⚠ Status: partial ({total_collected}/{max_notes} notes)")
+        # As long as MediaCrawler succeeded, mark as completed
+        BloggerDB.update_scrape_progress(user_id, total_collected, max_notes, 'completed')
+        BloggerDB.update_status(user_id, "scraped")
+        print(f"  ✓ Status: completed (collected {total_collected} notes)")
+        stats["scraped"] += 1
 
         stats["notes_added"] += notes_added
 
@@ -1273,6 +1232,319 @@ def scrape_specific_bloggers(
     print(f"{'='*60}\n")
 
     return stats
+
+
+def collect_blogger_by_manual_id(
+    user_id: str,
+    max_notes: int = 100,
+    add_to_db: bool = True,
+    nickname: str = None
+) -> Dict[str, any]:
+    """
+    手动采集指定博主ID的笔记
+
+    Args:
+        user_id: 小红书博主ID
+        max_notes: 最多采集笔记数量
+        add_to_db: 是否添加博主到数据库
+        nickname: 博主昵称（可选，实际使用会从MediaCrawler数据获取）
+
+    Returns:
+        Dict with collection stats:
+        {
+            "success": bool,
+            "user_id": str,
+            "notes_count": int,
+            "error": str (if failed)
+        }
+    """
+    print(f"\n{'='*60}")
+    print(f"📝 Manual Collection for Blogger ID: {user_id}")
+    print(f"{'='*60}\n")
+
+    try:
+        # Step 1: Run MediaCrawler FIRST to get blogger info and notes
+        print(f"🚀 Starting MediaCrawler to fetch blogger data...")
+        print(f"   Collection mode: creator")
+        print(f"   Max notes: {max_notes}")
+
+        success = run_mediacrawler_for_creator(user_id, max_notes)
+
+        if not success:
+            error_msg = "MediaCrawler execution failed"
+            print(f"   ❌ {error_msg}")
+            return {
+                "success": False,
+                "user_id": user_id,
+                "notes_count": 0,
+                "error": error_msg
+            }
+
+        print(f"   ✓ MediaCrawler completed successfully")
+
+        # Step 2: Load blogger info from creator_creators.json
+        print(f"📚 Loading blogger info from MediaCrawler output...")
+        json_dir = MEDIA_CRAWLER_ROOT / "data" / "xhs" / "json"
+
+        # Find the latest creator_creators file
+        creator_files = list(json_dir.glob("creator_creators_*.json"))
+        if not creator_files:
+            error_msg = "No creator_creators_*.json file found"
+            print(f"   ❌ {error_msg}")
+            return {
+                "success": False,
+                "user_id": user_id,
+                "notes_count": 0,
+                "error": error_msg
+            }
+
+        latest_creator_file = max(creator_files, key=lambda p: p.stat().st_mtime)
+        print(f"   📂 Loading from: {latest_creator_file.name}")
+
+        # Load and parse creator data
+        try:
+            with open(latest_creator_file, 'r', encoding='utf-8') as f:
+                creators = json.load(f)
+        except Exception as e:
+            error_msg = f"Failed to read creator_creators.json: {str(e)}"
+            print(f"   ❌ {error_msg}")
+            return {
+                "success": False,
+                "user_id": user_id,
+                "notes_count": 0,
+                "error": error_msg
+            }
+
+        # Find our blogger in the creators list
+        creator_info = None
+        for creator in creators:
+            if creator.get("user_id") == user_id:
+                creator_info = creator
+                break
+
+        if not creator_info:
+            error_msg = f"Blogger {user_id} not found in creator_creators.json"
+            print(f"   ❌ {error_msg}")
+            return {
+                "success": False,
+                "user_id": user_id,
+                "notes_count": 0,
+                "error": error_msg
+            }
+
+        # Extract blogger info with fallbacks
+        extracted_nickname = creator_info.get("nickname", "").strip() or nickname or f"user_{user_id[:8]}"
+        extracted_avatar = creator_info.get("avatar", "").strip()
+        extracted_fans = int(creator_info.get("fans", 0) or 0)
+        extracted_desc = creator_info.get("desc", "").strip()
+        extracted_gender = creator_info.get("gender", "")
+        extracted_location = creator_info.get("ip_location", "")
+        follows = int(creator_info.get("follows", 0) or 0)
+        interaction = int(creator_info.get("interaction", 0) or 0)
+
+        print(f"   ✓ Blogger info loaded:")
+        print(f"      - Nickname: {extracted_nickname}")
+        print(f"      - Fans: {extracted_fans:,}")
+        print(f"      - Avatar: {'Yes' if extracted_avatar else 'No'}")
+        print(f"      - Location: {extracted_location or 'N/A'}")
+
+        # Step 3: Insert or update blogger in database
+        if add_to_db:
+            existing_blogger = BloggerDB.get_blogger(user_id)
+
+            if existing_blogger:
+                print(f"\nℹ️  Blogger already exists in database")
+                print(f"   Current nickname: {existing_blogger.get('nickname')}")
+                print(f"   Current fans: {existing_blogger.get('current_fans', 0):,}")
+                print(f"   Updating with fresh data...")
+
+                # Update blogger info with latest data
+                BloggerDB.update_blogger_info(
+                    user_id=user_id,
+                    nickname=extracted_nickname,
+                    avatar_url=extracted_avatar if extracted_avatar else None,
+                    current_fans=extracted_fans
+                )
+                print(f"   ✓ Blogger updated")
+
+                # Get existing notes count
+                existing_notes_count = NoteDB.count_notes_by_user(user_id)
+                print(f"   Existing notes: {existing_notes_count}")
+
+                if existing_notes_count >= max_notes:
+                    print(f"   ⚠️  Already has {existing_notes_count} notes (target: {max_notes})")
+                    print(f"   Skipping data import.")
+                    BloggerDB.update_scrape_progress(
+                        user_id=user_id,
+                        notes_collected=existing_notes_count,
+                        notes_target=max_notes,
+                        scrape_status='completed'
+                    )
+                    BloggerDB.update_status(user_id, "scraped")
+
+                    return {
+                        "success": True,
+                        "user_id": user_id,
+                        "notes_count": existing_notes_count,
+                        "message": "Already collected enough notes"
+                    }
+
+                # Update progress for additional collection
+                BloggerDB.update_scrape_progress(
+                    user_id=user_id,
+                    notes_collected=existing_notes_count,
+                    notes_target=max_notes,
+                    scrape_status='in_progress'
+                )
+            else:
+                # Insert new blogger with full info (no placeholder needed!)
+                print(f"\n➕ Inserting new blogger into database...")
+                BloggerDB.insert_blogger(
+                    user_id=user_id,
+                    nickname=extracted_nickname,
+                    avatar_url=extracted_avatar if extracted_avatar else None,
+                    initial_fans=extracted_fans,
+                    source_keyword="manual_input"
+                )
+
+                # Initialize progress
+                BloggerDB.update_scrape_progress(
+                    user_id=user_id,
+                    notes_collected=0,
+                    notes_target=max_notes,
+                    scrape_status='in_progress'
+                )
+
+                print(f"   ✓ Blogger added with complete info:")
+                print(f"      - Nickname: {extracted_nickname}")
+                print(f"      - Initial fans: {extracted_fans:,}")
+
+        # Step 4: Load notes from creator_contents.json
+        print(f"\n📚 Loading notes from MediaCrawler output...")
+
+        # Find the latest creator_content file
+        content_files = list(json_dir.glob("creator_contents_*.json"))
+        if not content_files:
+            error_msg = "No creator_contents_*.json file found"
+            print(f"   ❌ {error_msg}")
+
+            if add_to_db:
+                print(f"   🗑️  Auto-deleting blogger (no notes found)...")
+                NoteDB.delete_notes_by_user(user_id)
+                BloggerDB.delete_blogger(user_id)
+
+            return {
+                "success": False,
+                "user_id": user_id,
+                "notes_count": 0,
+                "error": error_msg
+            }
+
+        latest_content_file = max(content_files, key=lambda p: p.stat().st_mtime)
+        print(f"   📂 Loading from: {latest_content_file.name}")
+
+        all_notes = load_notes_from_json(latest_content_file)
+
+        # Filter notes for this specific user_id
+        notes = [note for note in all_notes if note["user_id"] == user_id]
+        print(f"   ✓ Found {len(notes)} note(s) for user {user_id}")
+
+        if not notes and add_to_db:
+            # blogger exists but no notes - this is acceptable (blogger might have no public notes)
+            print(f"   ℹ️  No notes found for this blogger (may have private or deleted content)")
+            total_in_db = NoteDB.count_notes_by_user(user_id)
+
+            BloggerDB.update_scrape_progress(
+                user_id=user_id,
+                notes_collected=total_in_db,
+                notes_target=max_notes,
+                scrape_status='completed'
+            )
+            BloggerDB.update_status(user_id, "scraped")
+
+            return {
+                "success": True,
+                "user_id": user_id,
+                "notes_count": 0,
+                "message": "No notes available for this blogger"
+            }
+
+        # Step 5: Save notes to database
+        print(f"\n💾 Saving notes to database...")
+        notes_added = 0
+
+        for note in notes:
+            try:
+                note_success = NoteDB.insert_note(
+                    note_id=note["note_id"],
+                    user_id=note["user_id"],
+                    title=note["title"],
+                    desc=note["desc"],
+                    note_type=note["type"],
+                    likes=note["likes"],
+                    collects=note["collects"],
+                    comments=note["comments"],
+                    create_time=note["create_time"],
+                    cover_url=note["cover_url"],
+                    note_url=note.get("note_url", "")
+                )
+                if note_success:
+                    notes_added += 1
+            except Exception as e:
+                print(f"   ⚠️  Failed to save note {note['note_id']}: {e}")
+
+        # Get total count in database
+        total_notes = NoteDB.count_notes_by_user(user_id)
+        print(f"   ✓ Saved {notes_added} new notes (Total: {total_notes})")
+
+        # Step 6: Update progress and status
+        if add_to_db:
+            BloggerDB.update_scrape_progress(
+                user_id=user_id,
+                notes_collected=total_notes,
+                notes_target=max_notes,
+                scrape_status='completed'
+            )
+            BloggerDB.update_status(user_id, "scraped")
+            print(f"   ✓ Collection completed!")
+
+        print(f"\n{'='*60}")
+        print(f"✅ Manual collection completed!")
+        print(f"   User ID: {user_id}")
+        print(f"   Nickname: {extracted_nickname}")
+        print(f"   Fans: {extracted_fans:,}")
+        print(f"   Notes added: {notes_added}")
+        print(f"   Total notes: {total_notes}")
+        print(f"{'='*60}\n")
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "notes_count": total_notes,
+            "notes_added": notes_added,
+            "nickname": extracted_nickname,
+            "fans": extracted_fans
+        }
+
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        print(f"\n❌ {error_msg}")
+
+        if add_to_db:
+            try:
+                print(f"🗑️  Auto-deleting blogger due to error...")
+                notes_deleted = NoteDB.delete_notes_by_user(user_id)
+                blogger_deleted = BloggerDB.delete_blogger(user_id)
+                print(f"✓ Deleted {notes_deleted} notes and blogger record")
+            except Exception as delete_error:
+                print(f"⚠️  Failed to auto-delete: {delete_error}")
+
+        return {
+            "success": False,
+            "user_id": user_id,
+            "notes_count": 0,
+            "error": error_msg
+        }
 
 
 def main():

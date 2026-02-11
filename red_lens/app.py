@@ -781,43 +781,61 @@ def show_detailed_analysis():
     from red_lens.analyzer import report_exists, load_report_from_file, delete_report_file, generate_ai_report
     import config
 
-    # Check if report exists
-    has_report = report_exists(selected_user_id)
+    # Create report mode selector - use FIXED global key to ensure consistent state
+    report_mode = st.radio(
+        "报告模式",
+        options=["流量拆解", "个人复盘"],
+        horizontal=True,
+        help="流量拆解：分析账号成长逻辑和流量分发机制｜个人复盘：为您个人提供深度诊断和具体行动建议",
+        key="ai_report_mode_global"
+    )
+
+    # Convert to internal mode value
+    internal_report_mode = "traffic" if report_mode == "流量拆解" else "personal"
+
+    # Check if report exists for current mode
+    has_report = report_exists(selected_user_id, internal_report_mode)
 
     # Configuration controls
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        use_real_api = st.checkbox(
-            "使用真实 Deepseek API",
-            value=config.ENABLE_REAL_AI,
-            help="需要配置 DEEPSEEK_API_KEY 环境变量"
-        )
-    with col2:
-        # Show report status
-        if has_report:
-            st.info("✓ 已有报告")
-        else:
-            st.caption("无报告")
-    with col3:
-        if has_report and st.button("🗑️ 删除报告", help="删除当前博主的AI报告"):
-            if delete_report_file(selected_user_id):
-                st.success("报告已删除")
-                st.rerun()
+    with st.container():
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            use_real_api = st.checkbox(
+                "使用真实 Deepseek API",
+                value=config.ENABLE_REAL_AI,
+                key=f"use_real_api_{selected_user_id}",
+                help="需要配置 DEEPSEEK_API_KEY 环境变量"
+            )
+        with col2:
+            # Show report status
+            if has_report:
+                st.info("✓ 已有报告")
+            else:
+                st.caption("无报告")
+        with col3:
+            if has_report and st.button("🗑️ 删除报告", help="删除当前博主的AI报告", key=f"delete_btn_{selected_user_id}"):
+                if delete_report_file(selected_user_id, internal_report_mode):
+                    st.success("报告已删除")
+                    st.rerun()
 
     # Display existing report if available
+    # Use a container with mode-specific key to ensure proper refresh when mode changes
     if has_report:
-        existing_report = load_report_from_file(selected_user_id)
+        existing_report = load_report_from_file(selected_user_id, internal_report_mode)
         if existing_report:
             st.markdown(existing_report)
             st.markdown("---")
 
     # Generate/Regenerate button
+    # Include mode in the key to avoid stale button states
     col_btn1, col_btn2 = st.columns([1, 3])
     with col_btn1:
         if has_report:
-            generate_btn = st.button("🔄 重新生成报告", type="secondary", use_container_width=True)
+            generate_btn = st.button("🔄 重新生成报告", type="secondary", use_container_width=True,
+                                    key=f"generate_btn_{selected_user_id}_{internal_report_mode}")
         else:
-            generate_btn = st.button("✨ 生成 AI 报告", type="primary", use_container_width=True)
+            generate_btn = st.button("✨ 生成 AI 报告", type="primary", use_container_width=True,
+                                    key=f"generate_btn_{selected_user_id}_{internal_report_mode}")
     with col_btn2:
         if use_real_api:
             st.caption("💡 使用真实 API 生成报告")
@@ -830,7 +848,12 @@ def show_detailed_analysis():
         spinner_text = "AI 正在分析..." if use_real_api else "生成模拟报告..."
         with st.spinner(spinner_text):
             try:
-                report = generate_ai_report(selected_user_id, use_mock=use_mock, force_regenerate=force_regenerate)
+                report = generate_ai_report(
+                    selected_user_id,
+                    use_mock=use_mock,
+                    force_regenerate=force_regenerate,
+                    report_mode=internal_report_mode
+                )
                 if report.startswith("Error:"):
                     st.error(report)
                 else:

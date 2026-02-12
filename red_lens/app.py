@@ -217,7 +217,8 @@ def main():
                                 max_notes=max_notes_per_blogger,
                                 min_fans=min_fans,
                                 resume_partial=False,  # Disable resume in normal mode
-                                batch_size=batch_size
+                                batch_size=batch_size,
+                                source_keyword=filter_keyword  # Pass keyword filter
                             )
 
                             msg = f"✓ 采集完成! 成功: {stats['scraped']}, 失败: {stats['failed']}, 笔记: {stats['notes_added']}"

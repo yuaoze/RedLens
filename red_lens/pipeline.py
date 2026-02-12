@@ -46,7 +46,9 @@ def fetch_creators_fans_batch(user_ids: List[str]) -> Dict[str, int]:
             print(f"    ✗ MediaCrawler failed")
             return {uid: 0 for uid in user_ids}
 
-        # Read fans from the generated creator JSON file
+        # Read fans from the generated creator JSON files
+        # Note: MediaCrawler generates new files on each run, and we need to search all files
+        # because the target user_ids might be in different files from different batches
         json_dir = MEDIA_CRAWLER_ROOT / "data" / "xhs" / "json"
         creator_files = list(json_dir.glob("creator_creators_*.json"))
 
@@ -54,23 +56,77 @@ def fetch_creators_fans_batch(user_ids: List[str]) -> Dict[str, int]:
             print(f"    ✗ No creator JSON file found")
             return {uid: 0 for uid in user_ids}
 
-        latest_file = max(creator_files, key=lambda p: p.stat().st_mtime)
+        # Search all recent creator files for the requested user_ids
+        # Sort by modification time (most recent first)
+        creator_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
-        with open(latest_file, 'r', encoding='utf-8') as f:
-            creators = json.load(f)
+        found_count = 0
+        remaining_ids = set(user_ids)
 
-        # Build dictionary of user_id -> fans
-        for creator in creators:
-            user_id = creator.get("user_id")
-            if user_id in user_ids:
-                fans_raw = creator.get("fans", 0)
-                fans = int(fans_raw) if fans_raw else 0
-                result[user_id] = fans
+        for json_file in creator_files:
+            if not remaining_ids:
+                break  # All users found
+
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    creators = json.load(f)
+
+                # Build dictionary of user_id -> fans from this file
+                for creator in creators:
+                    user_id = creator.get("user_id")
+                    if user_id in remaining_ids:
+                        fans_raw = creator.get("fans", 0)
+                        fans = int(fans_raw) if fans_raw else 0
+                        result[user_id] = fans
+                        remaining_ids.remove(user_id)
+                        found_count += 1
+                        print(f"      ✓ {creator.get('nickname', 'Unknown')}: {fans:,} fans (from {json_file.name})")
+
+            except Exception as e:
+                print(f"      ⚠ Warning: Failed to read {json_file.name}: {e}")
+                continue
+
+        # Fallback: Try to search in creator_contents files for missing users
+        if remaining_ids:
+            print(f"      ℹ️  Some user_ids not found in creator_creators files, checking creator_contents...")
+            content_files = list(json_dir.glob("creator_contents_*.json"))
+            content_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+            # Create a mapping from content files (content files don't have fans count)
+            # We'll just record that the user exists but fans=0 (cannot get fans from content files)
+            for json_file in content_files:
+                if not remaining_ids:
+                    break
+
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        contents = json.load(f)
+
+                    for content in contents:
+                        user_id = content.get("user_id")
+                        if user_id in remaining_ids:
+                            result[user_id] = 0  # Can't get fans from content file
+                            remaining_ids.remove(user_id)
+                            print(f"      ⚠ {content.get('nickname', 'Unknown')}: found in content file but fans count not available (from {json_file.name})")
+                except Exception as e:
+                    continue
+
+        # Final check: If MediaCrawler just ran but creator_creators file is empty/invalid, this indicates
+        # a problem with MediaCrawler's get_creator_info function (HTML parsing failure)
+        if remaining_ids and len(creator_files) > 0:
+            # Check if the most recent creator_creators file is very recent (last 5 minutes)
+            latest_creator_file = creator_files[0]
+            file_age_seconds = (datetime.now().timestamp() - latest_creator_file.stat().st_mtime)
+            if file_age_seconds < 60:
+                print(f"      ⚠️  Warning: Latest creator_creators file exists but doesn't contain requested user_ids.")
+                print(f"      ⚠️  This typically means MediaCrawler's get_creator_info() failed to parse HTML.")
+                print(f"      ⚠️  The bloggers exist but their fans count cannot be retrieved without a working creator info fetch.")
 
         # Fill in missing users with 0
         for uid in user_ids:
             if uid not in result:
                 result[uid] = 0
+                print(f"      ✗ User {uid[:12]}... not found in any JSON file")
 
         print(f"    ✓ Successfully fetched fans for {len([f for f in result.values() if f > 0])}/{len(user_ids)} creator(s)")
         return result
@@ -503,7 +559,8 @@ def scrape_pending_bloggers(
     max_notes: int = 100,
     min_fans: int = 0,
     resume_partial: bool = True,
-    batch_size: int = 5
+    batch_size: int = 5,
+    source_keyword: Optional[str] = None
 ) -> Dict[str, int]:
     """
     Scrape notes for pending bloggers with resume capability
@@ -515,6 +572,7 @@ def scrape_pending_bloggers(
         min_fans: Minimum fans threshold - skip bloggers with fewer fans (default: 0 = no filtering)
         resume_partial: If True, resume incomplete scraping for partial status bloggers
         batch_size: Number of bloggers to process in each batch when running MediaCrawler (default: 5)
+        source_keyword: Source keyword filter - only scrape bloggers matching this keyword (default: None = all keywords)
 
     Returns:
         Dictionary with statistics (scraped, failed, notes_added, skipped_low_fans, resumed)
@@ -526,6 +584,8 @@ def scrape_pending_bloggers(
     print(f"{'='*60}")
     print(f"Mode: {'Using existing data' if use_existing_data else 'Running MediaCrawler'}")
     print(f"Max bloggers to scrape: {limit}")
+    if source_keyword:
+        print(f"Source keyword filter: {source_keyword}")
     if not use_existing_data:
         print(f"Max notes per blogger: {max_notes}")
     if min_fans > 0:
@@ -546,9 +606,44 @@ def scrape_pending_bloggers(
 
     target_bloggers.extend(pending_bloggers[:max(0, limit - len(target_bloggers))])
 
-    if not target_bloggers:
-        print("✓ No bloggers to scrape")
-        return {"scraped": 0, "failed": 0, "notes_added": 0, "skipped_low_fans": 0, "resumed": 0}
+    # Filter by source_keyword if specified
+    if source_keyword:
+        print(f"\n{'='*60}")
+        print(f"Filtering by source keyword: {source_keyword}")
+        print(f"{'='*60}\n")
+
+        # Get all pending bloggers by keyword (with higher limit to ensure we find enough)
+        all_pending_by_keyword = BloggerDB.get_pending_bloggers_by_keyword(source_keyword, limit=1000)
+
+        # Get resumable bloggers by keyword
+        all_resumable_by_keyword = []
+        if resume_partial and resumable_count > 0:
+            all_resumable = BloggerDB.get_resumable_bloggers(limit=1000)
+            all_resumable_by_keyword = [
+                b for b in all_resumable
+                if b.get('source_keyword', '').find(source_keyword) != -1
+            ]
+
+        # Mix resumable and pending bloggers that match the keyword
+        keyword_matched = all_pending_by_keyword + all_resumable_by_keyword
+
+        # Remove duplicates by user_id
+        seen_ids = set()
+        keyword_matchers = []
+        for b in keyword_matched:
+            if b['user_id'] not in seen_ids:
+                seen_ids.add(b['user_id'])
+                keyword_matchers.append(b)
+
+        # Limit to requested number
+        target_bloggers = keyword_matchers[:limit]
+
+        print(f"  Found {len(keyword_matchers)} blogger(s) matching keyword '{source_keyword}'")
+        print(f"  Limited to {len(target_bloggers)} blogger(s) for scraping")
+
+        if not target_bloggers:
+            print("✓ No bloggers match the specified keyword")
+            return {"scraped": 0, "failed": 0, "notes_added": 0, "skipped_low_fans": 0, "resumed": 0}
 
     print(f"📋 Found {len(target_bloggers)} blogger(s) to process:")
     for blogger in target_bloggers:

@@ -554,6 +554,25 @@ def prepare_images_for_ai(notes: List[Dict], max_images: int = None, use_base64:
                     response.raise_for_status()
                     img_data = response.content
 
+                    # Save downloaded image to local covers directory (v1.2.11 fix)
+                    if user_id and note_id:
+                        from pathlib import Path
+                        covers_dir = Path(__file__).parent / 'assets' / 'covers'
+                        covers_dir.mkdir(parents=True, exist_ok=True)
+
+                        cover_file = covers_dir / f"{note_id}.jpg"
+                        try:
+                            with open(cover_file, 'wb') as f:
+                                f.write(img_data)
+
+                            # Update database with local cover path
+                            local_cover_path = str(cover_file.resolve())
+                            from red_lens.db import NoteDB
+                            NoteDB.update_local_cover_path(note_id, local_cover_path)
+                            print(f"    ✓ Saved to local: {cover_file.name}")
+                        except Exception as save_error:
+                            print(f"    ⚠️ Failed to save locally: {save_error}")
+
                 except Exception as e:
                     print(f"    ✗ Failed to download image: {e}")
                     continue

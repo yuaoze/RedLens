@@ -598,11 +598,22 @@ def show_outlier_gallery():
                     # Display image if available
                     if note["local_cover_path"]:
                         try:
-                            st.image(note["local_cover_path"], use_container_width=True)
-                        except:
-                            st.info("封面图加载失败")
+                            # Check if file exists first
+                            from pathlib import Path
+                            cover_path = Path(note["local_cover_path"])
+
+                            # If path is relative, resolve it from red_lens directory
+                            if not cover_path.is_absolute():
+                                cover_path = Path(__file__).parent / note["local_cover_path"]
+
+                            if cover_path.exists():
+                                st.image(str(cover_path), use_column_width=True)
+                            else:
+                                st.warning(f"封面文件不存在: {cover_path.name}")
+                        except Exception as e:
+                            st.error(f"封面图加载失败: {str(e)}")
                     elif note["cover_url"]:
-                        st.info("封面未下载")
+                        st.info("封面未下载，点击上方【📥 下载爆款封面】按钮下载")
                     else:
                         st.info("无封面图")
 
@@ -779,89 +790,342 @@ def show_detailed_analysis():
     st.subheader("🤖 AI 洞察报告")
 
     # Import report functions
-    from red_lens.analyzer import report_exists, load_report_from_file, delete_report_file, generate_ai_report
+    from red_lens.analyzer import report_exists, generate_ai_report
+    from red_lens.db import AIReportDB
     import config
 
-    # Create report mode selector - use FIXED global key to ensure consistent state
-    report_mode = st.radio(
-        "报告模式",
-        options=["流量拆解", "个人复盘"],
-        horizontal=True,
-        help="流量拆解：分析账号成长逻辑和流量分发机制｜个人复盘：为您个人提供深度诊断和具体行动建议",
-        key="ai_report_mode_global"
-    )
+    # Provider display names (shared across sections)
+    provider_display_names = {
+        "deepseek": "🧠 Deepseek",
+        "kimi": "🌙 KIMI (Moonshot)"
+    }
 
-    # Convert to internal mode value
-    internal_report_mode = "traffic" if report_mode == "流量拆解" else "personal"
+    # ===== Section 1: Model Config + Generate (collapsible) =====
+    with st.expander("🎯 生成新报告", expanded=True):
+        col1, col2 = st.columns([1, 1])
 
-    # Check if report exists for current mode
-    has_report = report_exists(selected_user_id, internal_report_mode)
-
-    # Configuration controls
-    with st.container():
-        col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
-            use_real_api = st.checkbox(
-                "使用真实 Deepseek API",
-                value=config.ENABLE_REAL_AI,
-                key=f"use_real_api_{selected_user_id}",
-                help="需要配置 DEEPSEEK_API_KEY 环境变量"
+            # Provider selector
+            provider_options = list(config.AI_PROVIDERS.keys())
+
+            selected_provider = st.selectbox(
+                "AI服务提供商",
+                options=provider_options,
+                format_func=lambda x: provider_display_names.get(x, x),
+                index=provider_options.index(config.DEFAULT_AI_PROVIDER),
+                help="选择AI服务提供商。KIMI支持图像分析，Deepseek专注文本推理。",
+                key=f"ai_provider_selector_{selected_user_id}"
+            )
+
+        with col2:
+            # Model selector
+            provider_config = config.AI_PROVIDERS[selected_provider]
+            model_options = list(provider_config["models"].keys())
+
+            selected_model = st.selectbox(
+                "AI模型",
+                options=model_options,
+                format_func=lambda x: provider_config["models"][x]["display_name"],
+                index=model_options.index(provider_config["default_model"]),
+                help="选择具体的AI模型。带Vision的模型支持分析笔记封面图片。",
+                key=f"ai_model_selector_{selected_user_id}"
+            )
+
+        # API Key configuration
+        model_info = provider_config["models"][selected_model]
+        api_key = provider_config["api_key"]
+        manual_api_key = None
+
+        if not api_key:
+            st.warning(f"⚠️ 未检测到 {selected_provider.upper()}_API_KEY 环境变量")
+
+            st.markdown(f"""
+            **方式1: 手动输入（临时）** - 在下方输入框中输入API Key，仅当前会话有效。
+            **方式2: 配置环境变量（推荐）**
+            """)
+
+            if selected_provider == "kimi":
+                st.code("export KIMI_API_KEY='your_key_here'", language="bash")
+            else:
+                st.code("export DEEPSEEK_API_KEY='your_key_here'", language="bash")
+
+            manual_api_key = st.text_input(
+                "输入API Key",
+                type="password",
+                placeholder="sk-...",
+                key=f"manual_api_key_{selected_provider}_{selected_user_id}",
+                help="输入的API Key仅在当前会话中使用，不会被保存"
+            )
+
+            if manual_api_key:
+                st.success("✅ 已输入API Key，可以生成报告")
+        else:
+            masked_key = api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***"
+            st.success(f"✅ 已配置API Key: {masked_key}")
+
+        final_api_key = manual_api_key if manual_api_key else api_key
+
+        # Report mode selector
+        report_mode = st.radio(
+            "报告模式",
+            options=["流量拆解", "个人复盘"],
+            horizontal=True,
+            help="流量拆解：分析账号成长逻辑和流量分发机制｜个人复盘：为您个人提供深度诊断和具体行动建议",
+            key=f"ai_report_mode_{selected_user_id}"
+        )
+
+        internal_report_mode = "traffic" if report_mode == "流量拆解" else "personal"
+
+        # Check if this specific report already exists
+        has_report = report_exists(selected_user_id, internal_report_mode, selected_provider, selected_model)
+
+        # Generate button
+        col_btn1, col_btn2 = st.columns([1, 3])
+        with col_btn1:
+            if has_report:
+                generate_btn = st.button("🔄 重新生成", type="secondary", use_container_width=True,
+                                        key=f"generate_btn_{selected_user_id}_{internal_report_mode}_{selected_provider}_{selected_model}")
+            else:
+                generate_btn = st.button("✨ 生成报告", type="primary", use_container_width=True,
+                                        key=f"generate_btn_{selected_user_id}_{internal_report_mode}_{selected_provider}_{selected_model}")
+        with col_btn2:
+            if has_report:
+                st.caption(f"💡 使用 {provider_display_names[selected_provider]} {selected_model} | 已有该配置的报告，点击可重新生成")
+            else:
+                st.caption(f"💡 使用 {provider_display_names[selected_provider]} {selected_model}")
+
+        if generate_btn:
+            if not final_api_key:
+                st.error("❌ 请先配置API Key！")
+                st.stop()
+
+            if manual_api_key:
+                import os
+                env_key_name = f"{selected_provider.upper()}_API_KEY"
+                os.environ[env_key_name] = manual_api_key
+                st.info(f"✓ 已临时设置环境变量 {env_key_name}")
+
+            force_regenerate = has_report
+            spinner_text = f"AI 正在分析（{provider_display_names[selected_provider]}）..."
+
+            with st.spinner(spinner_text):
+                try:
+                    report = generate_ai_report(
+                        selected_user_id,
+                        use_mock=False,
+                        force_regenerate=force_regenerate,
+                        report_mode=internal_report_mode,
+                        provider=selected_provider,
+                        model=selected_model
+                    )
+                    if report.startswith("Error:") or report.startswith("# 报告生成失败"):
+                        st.error(report)
+                    else:
+                        # Store the newly generated report key so the dropdown auto-selects it
+                        st.session_state[f"last_generated_report_{selected_user_id}"] = {
+                            'mode': internal_report_mode,
+                            'provider': selected_provider,
+                            'model': selected_model
+                        }
+                        st.success("✓ 报告生成成功！")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"生成报告失败: {str(e)}")
+                    import traceback
+                    with st.expander("查看错误详情"):
+                        st.code(traceback.format_exc())
+
+    # ===== Section 2: Report Display with Dropdown =====
+    st.markdown("---")
+    st.markdown("### 📄 已有报告")
+
+    all_reports = AIReportDB.get_reports_by_user(selected_user_id)
+
+    if all_reports:
+        # Build report options
+        report_options = {}
+        report_display_list = []
+
+        for idx, report_info in enumerate(all_reports):
+            r_mode = report_info['report_mode']
+            r_provider = report_info['provider']
+            r_model = report_info['model_name']
+            r_created = report_info['generated_at']
+            r_file_path = report_info.get('report_file_path', '')
+
+            mode_cn = "流量拆解" if r_mode == "traffic" else "个人复盘"
+            provider_icon = provider_display_names.get(r_provider, r_provider)
+
+            display_name = f"{mode_cn} | {provider_icon}"
+            if r_model:
+                display_name += f" - {r_model}"
+            display_name += f" | {r_created}"
+
+            report_options[display_name] = {
+                'mode': r_mode,
+                'provider': r_provider,
+                'model': r_model,
+                'file_path': r_file_path,
+                'index': idx
+            }
+            report_display_list.append(display_name)
+
+        # Determine default selection: prefer newly generated report
+        default_index = 0
+        last_gen = st.session_state.get(f"last_generated_report_{selected_user_id}")
+        if last_gen:
+            for i, name in enumerate(report_display_list):
+                info = report_options[name]
+                if (info['mode'] == last_gen['mode'] and
+                    info['provider'] == last_gen['provider'] and
+                    info['model'] == last_gen['model']):
+                    default_index = i
+                    break
+
+        # Dropdown selector and report count
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            selected_report_name = st.selectbox(
+                "选择报告",
+                options=report_display_list,
+                index=default_index,
+                key=f"report_selector_{selected_user_id}",
+                help=f"共有 {len(all_reports)} 个报告，通过下拉栏切换查看"
             )
         with col2:
-            # Show report status
-            if has_report:
-                st.info("✓ 已有报告")
-            else:
-                st.caption("无报告")
-        with col3:
-            if has_report and st.button("🗑️ 删除报告", help="删除当前博主的AI报告", key=f"delete_btn_{selected_user_id}"):
-                if delete_report_file(selected_user_id, internal_report_mode):
-                    st.success("报告已删除")
-                    st.rerun()
+            st.markdown(f"**共 {len(all_reports)} 份**")
 
-    # Display existing report if available
-    # Use a container with mode-specific key to ensure proper refresh when mode changes
-    if has_report:
-        existing_report = load_report_from_file(selected_user_id, internal_report_mode)
-        if existing_report:
-            st.markdown(existing_report)
+        if selected_report_name:
+            selected_info = report_options[selected_report_name]
+            view_mode = selected_info['mode']
+            view_provider = selected_info['provider']
+            view_model = selected_info['model']
+            file_path = selected_info.get('file_path', '')
+
+            # Display note covers (v1.2.11) - 放在选择报告下方
             st.markdown("---")
+            st.markdown("### 📷 报告相关封面")
 
-    # Generate/Regenerate button
-    # Include mode in the key to avoid stale button states
-    col_btn1, col_btn2 = st.columns([1, 3])
-    with col_btn1:
-        if has_report:
-            generate_btn = st.button("🔄 重新生成报告", type="secondary", use_container_width=True,
-                                    key=f"generate_btn_{selected_user_id}_{internal_report_mode}")
-        else:
-            generate_btn = st.button("✨ 生成 AI 报告", type="primary", use_container_width=True,
-                                    key=f"generate_btn_{selected_user_id}_{internal_report_mode}")
-    with col_btn2:
-        if use_real_api:
-            st.caption("💡 使用真实 API 生成报告")
-        else:
-            st.caption("💡 使用 Mock 报告（测试模式）")
+            # Get note covers data from report info
+            note_covers_json = None
+            for report_info in all_reports:
+                if (report_info['report_mode'] == view_mode and
+                    report_info['provider'] == view_provider and
+                    report_info.get('model_name') == view_model):
+                    note_covers_json = report_info.get('note_covers')
+                    break
 
-    if generate_btn:
-        use_mock = not use_real_api
-        force_regenerate = has_report  # If report exists, force regenerate
-        spinner_text = "AI 正在分析..." if use_real_api else "生成模拟报告..."
-        with st.spinner(spinner_text):
-            try:
-                report = generate_ai_report(
-                    selected_user_id,
-                    use_mock=use_mock,
-                    force_regenerate=force_regenerate,
-                    report_mode=internal_report_mode
-                )
-                if report.startswith("Error:"):
-                    st.error(report)
-                else:
-                    st.success("✓ 报告生成成功！")
-                    st.rerun()  # Reload to display the new report
-            except Exception as e:
-                st.error(f"生成报告失败: {str(e)}")
+            if note_covers_json:
+                try:
+                    import json
+                    note_covers_data = json.loads(note_covers_json)
+                    covers = note_covers_data.get('covers', [])
+
+                    if covers:
+                        # Group covers by category
+                        top5_covers = [c for c in covers if c.get('category') == 'top5']
+                        top10_covers = [c for c in covers if c.get('category') == 'top10']
+                        bottom5_covers = [c for c in covers if c.get('category') == 'bottom5']
+
+                        # Display covers based on report mode
+                        if note_covers_data.get('report_mode') == 'traffic' and top5_covers:
+                            st.markdown("**流量拆解 - Top 5 爆款封面**")
+                            cols = st.columns(5)
+                            for idx, cover in enumerate(top5_covers[:5]):
+                                with cols[idx]:
+                                    cover_path = Path(cover['local_cover_path'])
+                                    if not cover_path.is_absolute():
+                                        cover_path = Path(__file__).parent / cover['local_cover_path']
+
+                                    if cover_path.exists():
+                                        st.image(str(cover_path), use_column_width=True)
+                                        st.caption(f"❤️ {cover['likes']:,}")
+                                        st.caption(cover['title'][:20] + "...")
+                                    else:
+                                        st.info("封面缺失")
+
+                        elif note_covers_data.get('report_mode') == 'personal':
+                            if top10_covers:
+                                st.markdown("**个人复盘 - Top 10 高赞封面**")
+                                # Display in 2 rows of 5
+                                for row in range(2):
+                                    cols = st.columns(5)
+                                    start_idx = row * 5
+                                    end_idx = min(start_idx + 5, len(top10_covers))
+                                    for idx in range(start_idx, end_idx):
+                                        cover = top10_covers[idx]
+                                        with cols[idx - start_idx]:
+                                            cover_path = Path(cover['local_cover_path'])
+                                            if not cover_path.is_absolute():
+                                                cover_path = Path(__file__).parent / cover['local_cover_path']
+
+                                            if cover_path.exists():
+                                                st.image(str(cover_path), use_column_width=True)
+                                                st.caption(f"❤️ {cover['likes']:,}")
+                                                st.caption(cover['title'][:20] + "...")
+                                            else:
+                                                st.info("封面缺失")
+
+                            if bottom5_covers:
+                                st.markdown("**个人复盘 - Bottom 5 待优化封面**")
+                                cols = st.columns(5)
+                                for idx, cover in enumerate(bottom5_covers[:5]):
+                                    with cols[idx]:
+                                        cover_path = Path(cover['local_cover_path'])
+                                        if not cover_path.is_absolute():
+                                            cover_path = Path(__file__).parent / cover['local_cover_path']
+
+                                        if cover_path.exists():
+                                            st.image(str(cover_path), use_column_width=True)
+                                            st.caption(f"❤️ {cover['likes']:,}")
+                                            st.caption(cover['title'][:20] + "...")
+                                        else:
+                                            st.info("封面缺失")
+                    else:
+                        st.info("该报告未记录封面信息（可能是旧版本生成）")
+                except Exception as e:
+                    st.warning(f"封面加载失败: {str(e)}")
+            else:
+                st.info("该报告未记录封面信息（可能是旧版本生成）")
+
+            # Load report content from the file path stored in DB
+            st.markdown("---")
+            report_content = None
+            if file_path and Path(file_path).exists():
+                try:
+                    report_content = Path(file_path).read_text(encoding='utf-8')
+                except Exception:
+                    report_content = None
+
+            if report_content:
+                with st.container():
+                    st.markdown(report_content)
+
+                # Delete button for selected report
+                st.markdown("---")
+                col_del1, col_del2 = st.columns([1, 4])
+                with col_del1:
+                    if st.button("🗑️ 删除此报告", key=f"del_report_{selected_user_id}_{view_mode}_{view_provider}_{view_model}"):
+                        # Delete file using the stored path
+                        try:
+                            if file_path and Path(file_path).exists():
+                                Path(file_path).unlink()
+                        except Exception:
+                            pass
+                        AIReportDB.delete_report(selected_user_id, view_mode, view_provider, view_model)
+                        # Clear last generated cache if it matches
+                        last_gen = st.session_state.get(f"last_generated_report_{selected_user_id}")
+                        if last_gen and last_gen['mode'] == view_mode and last_gen['provider'] == view_provider and last_gen['model'] == view_model:
+                            del st.session_state[f"last_generated_report_{selected_user_id}"]
+                        st.success("报告已删除")
+                        st.rerun()
+            else:
+                st.warning("报告文件不存在，可能已被手动删除")
+                if st.button("清理此记录", key=f"clean_report_{selected_user_id}_{view_mode}_{view_provider}_{view_model}"):
+                    AIReportDB.delete_report(selected_user_id, view_mode, view_provider, view_model)
+                    st.rerun()
+    else:
+        st.info("暂无已生成的报告。请在上方「生成新报告」中配置模型并生成。")
 
     # Top notes
     st.markdown("---")

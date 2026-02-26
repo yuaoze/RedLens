@@ -22,6 +22,304 @@ from red_lens.db import BloggerDB, NoteDB, init_db
 from red_lens.discovery import parse_count_str
 
 
+def refresh_note_cover_urls(note_ids: List[str]) -> Dict[str, Any]:
+    """
+    刷新指定笔记的封面URL
+
+    专门用于更新封面URL（临时链接会失效），使用XHS_SPECIFIED_NOTE_URL_LIST精准爬取
+    不会触发智能过滤，因为目的是更新而非采集新笔记
+
+    Args:
+        note_ids: 笔记ID列表
+
+    Returns:
+        统计信息: {"success": bool, "updated": int, "failed": int}
+    """
+    init_db()
+
+    print(f"\n{'='*60}")
+    print(f"刷新笔记封面URL (精准爬取模式)")
+    print(f"{'='*60}")
+
+    # 1. 从数据库获取指定笔记
+    target_notes = []
+    not_found_ids = []
+
+    for note_id in note_ids:
+        note = NoteDB.get_note(note_id)
+        if note:
+            target_notes.append(note)
+        else:
+            not_found_ids.append(note_id)
+            print(f"  ⚠️ 笔记 {note_id} 未在数据库中找到")
+
+    if not target_notes:
+        print(f"✗ 未找到任何有效笔记")
+        return {"success": False, "updated": 0, "failed": len(note_ids)}
+
+    print(f"📋 需要刷新 {len(target_notes)} 条笔记的封面URL")
+    if not_found_ids:
+        print(f"  ⚠️ 跳过 {len(not_found_ids)} 条未找到的笔记")
+
+    # 2. 构建笔记URL列表（使用数据库中的note_url字段）
+    note_urls = []
+    for note in target_notes:
+        # 优先使用数据库中的note_url
+        if note.get('note_url'):
+            note_urls.append(note['note_url'])
+        else:
+            # 如果没有note_url，则构建URL（向后兼容）
+            note_id = note['note_id']
+            note_urls.append(f"https://www.xiaohongshu.com/explore/{note_id}")
+            print(f"  ⚠️ 笔记 {note_id} 缺少note_url，使用默认格式")
+
+    print(f"📝 已收集 {len(note_urls)} 个笔记URL")
+
+    # 3. 使用MediaCrawler的detail模式爬取指定笔记
+    print(f"\n🚀 启动MediaCrawler (detail模式，精准爬取 {len(note_urls)} 条笔记)...")
+
+    success = _run_mediacrawler_for_specified_notes(note_urls)
+
+    if not success:
+        print(f"✗ MediaCrawler爬取失败")
+        return {"success": False, "updated": 0, "failed": len(note_ids)}
+
+    # 4. 加载爬取结果并更新数据库
+    print(f"\n💾 更新数据库中的封面URL...")
+
+    json_dir = MEDIA_CRAWLER_ROOT / "data" / "xhs" / "json"
+
+    # 查找最新的detail文件（detail模式的输出文件）
+    detail_files = list(json_dir.glob("detail_contents_*.json"))
+    if not detail_files:
+        print(f"✗ 未找到爬取结果文件")
+        print(f"  提示: 查找路径 {json_dir}")
+        print(f"  期望文件: detail_contents_YYYY-MM-DD.json")
+        return {"success": False, "updated": 0, "failed": len(note_ids)}
+
+    latest_file = max(detail_files, key=lambda p: p.stat().st_mtime)
+    print(f"📂 加载: {latest_file.name}")
+
+    try:
+        with open(latest_file, 'r', encoding='utf-8') as f:
+            notes_data = json.load(f)
+    except Exception as e:
+        print(f"✗ 读取文件失败: {e}")
+        return {"success": False, "updated": 0, "failed": 0}
+
+    # 5. 更新数据库中的cover_url
+    # 建立目标笔记ID集合，用于快速查找
+    target_note_ids = {note['note_id'] for note in target_notes}
+
+    updated_count = 0
+    failed_count = 0
+
+    for note_data in notes_data:
+        note_id = note_data.get('note_id')
+        if not note_id or note_id not in target_note_ids:
+            continue
+
+        # 获取新的封面URL
+        image_list = note_data.get('image_list', '')
+        new_cover_url = image_list.split(',')[0] if image_list else ''
+
+        if not new_cover_url:
+            print(f"  ⚠ {note_id}: 未找到封面URL")
+            failed_count += 1
+            continue
+
+        # 更新数据库
+        try:
+            NoteDB.update_cover_url(note_id, new_cover_url)
+            print(f"  ✓ {note_id}: 封面URL已更新")
+            updated_count += 1
+        except Exception as e:
+            print(f"  ✗ {note_id}: 更新失败 - {e}")
+            failed_count += 1
+
+    print(f"\n{'='*60}")
+    print(f"刷新完成")
+    print(f"{'='*60}")
+    print(f"✓ 成功更新: {updated_count} 条")
+    if failed_count > 0:
+        print(f"✗ 失败: {failed_count} 条")
+    print(f"{'='*60}\n")
+
+    return {
+        "success": updated_count > 0,
+        "updated": updated_count,
+        "failed": failed_count
+    }
+
+
+def _run_mediacrawler_for_specified_notes(note_urls: List[str]) -> bool:
+    """
+    运行MediaCrawler爬取指定的笔记列表（使用detail模式 + XHS_SPECIFIED_NOTE_URL_LIST）
+
+    Args:
+        note_urls: 笔记URL列表
+
+    Returns:
+        True if successful, False otherwise
+    """
+    print(f"\n🔍 配置MediaCrawler爬取 {len(note_urls)} 条指定笔记")
+
+    # 准备配置文件
+    base_config_file = MEDIA_CRAWLER_ROOT / "config" / "base_config.py"
+    xhs_config_file = MEDIA_CRAWLER_ROOT / "config" / "xhs_config.py"
+
+    # 读取配置
+    with open(base_config_file, 'r', encoding='utf-8') as f:
+        base_config_content = f.read()
+    with open(xhs_config_file, 'r', encoding='utf-8') as f:
+        xhs_config_content = f.read()
+
+    # 备份配置
+    base_backup = base_config_file.parent / "base_config.py.refresh_backup"
+    xhs_backup = xhs_config_file.parent / "xhs_config.py.refresh_backup"
+
+    with open(base_backup, 'w', encoding='utf-8') as f:
+        f.write(base_config_content)
+    with open(xhs_backup, 'w', encoding='utf-8') as f:
+        f.write(xhs_config_content)
+
+    try:
+        import subprocess
+
+        # 修改base_config: 设置为detail模式
+        base_config_content = re.sub(
+            r'CRAWLER_TYPE\s*=\s*\(.*?\n\)',
+            'CRAWLER_TYPE = "detail"',
+            base_config_content,
+            flags=re.DOTALL
+        )
+        base_config_content = re.sub(
+            r'CRAWLER_TYPE\s*=\s*"[^"]*"',
+            'CRAWLER_TYPE = "detail"',
+            base_config_content
+        )
+
+        # 禁用评论爬取
+        base_config_content = re.sub(
+            r'ENABLE_GET_COMMENTS\s*=\s*(True|False)',
+            'ENABLE_GET_COMMENTS = False',
+            base_config_content
+        )
+
+        # 保存修改后的base_config
+        with open(base_config_file, 'w', encoding='utf-8') as f:
+            f.write(base_config_content)
+
+        # 修改xhs_config: 设置XHS_SPECIFIED_NOTE_URL_LIST
+        url_list_str = ", ".join([f'"{url}"' for url in note_urls])
+
+        xhs_config_content = re.sub(
+            r'XHS_SPECIFIED_NOTE_URL_LIST\s*=\s*\[.*?\]',
+            f'XHS_SPECIFIED_NOTE_URL_LIST = [{url_list_str}]',
+            xhs_config_content,
+            flags=re.DOTALL
+        )
+
+        # 保存修改后的xhs_config
+        with open(xhs_config_file, 'w', encoding='utf-8') as f:
+            f.write(xhs_config_content)
+
+        print(f"  ✓ 配置已更新:")
+        print(f"    • note模式")
+        print(f"    • {len(note_urls)} 条指定笔记")
+        print(f"    • 评论=禁用")
+
+        # 运行MediaCrawler
+        print(f"\n  🚀 启动MediaCrawler...")
+
+        # 计算超时时间（每条笔记约4秒 + 60秒启动时间）
+        timeout_seconds = len(note_urls) * 4 + 60
+        timeout_seconds = max(120, min(timeout_seconds, 600))  # 最少2分钟，最多10分钟
+
+        print(f"  ⏱️  预计时间: {len(note_urls) * 4}s, 超时: {timeout_seconds}s")
+
+        # 检查uv
+        try:
+            uv_check = subprocess.run(["uv", "--version"], capture_output=True)
+            use_uv = (uv_check.returncode == 0)
+        except FileNotFoundError:
+            use_uv = False
+
+        if use_uv:
+            cmd = ["uv", "run", "main.py", "--platform", "xhs", "--lt", "qrcode", "--type", "detail"]
+        else:
+            cmd = [sys.executable, "main.py"]
+
+        print(f"\n{'='*60}")
+        print(f"MediaCrawler Output:")
+        print(f"{'='*60}\n")
+
+        # 运行
+        process = subprocess.Popen(
+            cmd,
+            cwd=MEDIA_CRAWLER_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+
+        output_lines = []
+        try:
+            for line in process.stdout:
+                print(line, end='')
+                output_lines.append(line)
+
+            return_code = process.wait(timeout=timeout_seconds)
+
+        except subprocess.TimeoutExpired:
+            print(f"\n⚠️  超时 ({timeout_seconds}s)")
+            process.kill()
+            return_code = -1
+        except Exception as e:
+            print(f"\n✗ 执行错误: {e}")
+            process.kill()
+            return_code = -1
+
+        print(f"\n{'='*60}")
+        print(f"MediaCrawler 完成")
+        print(f"{'='*60}\n")
+
+        if return_code == 0:
+            print(f"  ✓ 爬取成功")
+            return True
+        else:
+            print(f"  ✗ 爬取失败 (返回码: {return_code})")
+            if output_lines:
+                print(f"\n  ❌ 最后20行输出:")
+                for line in output_lines[-20:]:
+                    print(f"    {line}", end='')
+            return False
+
+    except Exception as e:
+        print(f"  ✗ 运行MediaCrawler失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    finally:
+        # 恢复配置
+        with open(base_backup, 'r', encoding='utf-8') as f:
+            original_base = f.read()
+        with open(base_config_file, 'w', encoding='utf-8') as f:
+            f.write(original_base)
+        base_backup.unlink()
+
+        with open(xhs_backup, 'r', encoding='utf-8') as f:
+            original_xhs = f.read()
+        with open(xhs_config_file, 'w', encoding='utf-8') as f:
+            f.write(original_xhs)
+        xhs_backup.unlink()
+
+        print(f"  ✓ 配置已恢复")
+
+
 def fetch_creators_fans_batch(user_ids: List[str]) -> Dict[str, int]:
     """
     Fetch fans count for multiple creators by running MediaCrawler once
@@ -984,6 +1282,68 @@ def scrape_pending_bloggers(
         print(f"✗ Failed: {stats['failed']}")
     print(f"{'='*60}\n")
 
+    # Auto-download covers for successfully scraped bloggers
+    if stats['scraped'] > 0:
+        print(f"\n{'='*60}")
+        print("📥 Auto-downloading note covers")
+        print(f"{'='*60}\n")
+
+        from red_lens.analyzer import download_note_covers
+
+        covers_stats = {
+            'success': 0,
+            'failed': 0,
+            'total_top': 0,
+            'total_bottom': 0
+        }
+
+        for blogger in qualified_bloggers:
+            user_id = blogger['user_id']
+            nickname = blogger['nickname']
+
+            # Only download for successfully scraped bloggers
+            progress = BloggerDB.get_scrape_progress(user_id)
+            if progress['scrape_status'] != 'completed':
+                continue
+
+            try:
+                print(f"📥 Downloading covers for: {nickname}")
+
+                # Get top 10 + bottom 5 note IDs for this blogger
+                notes = NoteDB.get_notes_by_user(user_id)
+                if not notes:
+                    print(f"  ⚠ No notes found for {nickname}")
+                    continue
+
+                sorted_notes = sorted(notes, key=lambda x: x['likes'], reverse=True)
+                top_10 = sorted_notes[:10]
+                bottom_5 = sorted_notes[-5:] if len(sorted_notes) > 5 else []
+                note_ids_to_download = [n['note_id'] for n in top_10 + bottom_5]
+
+                result = download_note_covers(note_ids_to_download, force_redownload=False)
+                print(f"  ✓ Downloaded: {result['downloaded']}, Skipped: {result['skipped']}, Failed: {result['failed']}")
+
+                covers_stats['success'] += 1
+                covers_stats['total_top'] += result['downloaded']
+                covers_stats['total_bottom'] += result['skipped']
+
+                if result['failed'] > 0:
+                    print(f"  ⚠ Failed: {result['failed']} covers")
+
+            except Exception as e:
+                print(f"  ✗ Failed to download covers: {e}")
+                covers_stats['failed'] += 1
+
+        print(f"\n{'='*60}")
+        print("Cover Download Summary")
+        print(f"{'='*60}")
+        print(f"✓ Bloggers processed: {covers_stats['success']}")
+        print(f"✓ Total Top covers: {covers_stats['total_top']}")
+        print(f"✓ Total Bottom covers: {covers_stats['total_bottom']}")
+        if covers_stats['failed'] > 0:
+            print(f"✗ Failed: {covers_stats['failed']}")
+        print(f"{'='*60}\n")
+
     return stats
 
 
@@ -1100,7 +1460,8 @@ def clean_all_data(json_dir: Optional[Path] = None) -> Dict[str, int]:
 def scrape_specific_bloggers(
     user_ids: List[str],
     max_notes: int = 100,
-    batch_size: int = 5
+    batch_size: int = 5,
+    auto_download_covers: bool = True
 ) -> Dict[str, int]:
     """
     为指定的博主列表采集笔记（带智能过滤，排除已采集笔记）
@@ -1111,6 +1472,7 @@ def scrape_specific_bloggers(
         user_ids: 要采集的博主 ID 列表
         max_notes: 每个博主的目标笔记数量（默认: 100）
         batch_size: 批处理大小（默认: 5）
+        auto_download_covers: 是否自动下载封面（默认: True）
 
     Returns:
         统计信息字典: {"scraped": int, "failed": int, "notes_added": int, "resumed": int}
@@ -1325,6 +1687,68 @@ def scrape_specific_bloggers(
     print(f"  Failed/Partial: {stats['failed']}")
     print(f"  Total new notes added: {stats['notes_added']}")
     print(f"{'='*60}\n")
+
+    # Auto-download covers for successfully scraped bloggers
+    if auto_download_covers and stats['scraped'] > 0:
+        print(f"\n{'='*60}")
+        print("📥 Auto-downloading note covers")
+        print(f"{'='*60}\n")
+
+        from red_lens.analyzer import download_note_covers
+
+        covers_stats = {
+            'success': 0,
+            'failed': 0,
+            'total_top': 0,
+            'total_bottom': 0
+        }
+
+        for blogger in target_bloggers:
+            user_id = blogger['user_id']
+            nickname = blogger['nickname']
+
+            # Only download for successfully scraped bloggers
+            progress = BloggerDB.get_scrape_progress(user_id)
+            if progress['scrape_status'] != 'completed':
+                continue
+
+            try:
+                print(f"📥 Downloading covers for: {nickname}")
+
+                # Get top 10 + bottom 5 note IDs for this blogger
+                notes = NoteDB.get_notes_by_user(user_id)
+                if not notes:
+                    print(f"  ⚠ No notes found for {nickname}")
+                    continue
+
+                sorted_notes = sorted(notes, key=lambda x: x['likes'], reverse=True)
+                top_10 = sorted_notes[:10]
+                bottom_5 = sorted_notes[-5:] if len(sorted_notes) > 5 else []
+                note_ids_to_download = [n['note_id'] for n in top_10 + bottom_5]
+
+                result = download_note_covers(note_ids_to_download, force_redownload=False)
+                print(f"  ✓ Downloaded: {result['downloaded']}, Skipped: {result['skipped']}, Failed: {result['failed']}")
+
+                covers_stats['success'] += 1
+                covers_stats['total_top'] += result['downloaded']
+                covers_stats['total_bottom'] += result['skipped']
+
+                if result['failed'] > 0:
+                    print(f"  ⚠ Failed: {result['failed']} covers")
+
+            except Exception as e:
+                print(f"  ✗ Failed to download covers: {e}")
+                covers_stats['failed'] += 1
+
+        print(f"\n{'='*60}")
+        print("Cover Download Summary")
+        print(f"{'='*60}")
+        print(f"✓ Bloggers processed: {covers_stats['success']}")
+        print(f"✓ Total Top covers: {covers_stats['total_top']}")
+        print(f"✓ Total Bottom covers: {covers_stats['total_bottom']}")
+        if covers_stats['failed'] > 0:
+            print(f"✗ Failed: {covers_stats['failed']}")
+        print(f"{'='*60}\n")
 
     return stats
 
@@ -1602,6 +2026,26 @@ def collect_blogger_by_manual_id(
             )
             BloggerDB.update_status(user_id, "scraped")
             print(f"   ✓ Collection completed!")
+
+        # Step 7: Auto-download covers
+        print(f"\n📥 Auto-downloading note covers...")
+        try:
+            from red_lens.analyzer import download_note_covers
+
+            # Get top 10 + bottom 5 note IDs for this blogger
+            notes = NoteDB.get_notes_by_user(user_id)
+            if notes:
+                sorted_notes = sorted(notes, key=lambda x: x['likes'], reverse=True)
+                top_10 = sorted_notes[:10]
+                bottom_5 = sorted_notes[-5:] if len(sorted_notes) > 5 else []
+                note_ids_to_download = [n['note_id'] for n in top_10 + bottom_5]
+
+                cover_result = download_note_covers(note_ids_to_download, force_redownload=False)
+                print(f"   ✓ Downloaded: {cover_result['downloaded']}, Skipped: {cover_result['skipped']}, Failed: {cover_result['failed']}")
+            else:
+                print(f"   ⚠ No notes found to download covers")
+        except Exception as e:
+            print(f"   ⚠️  Cover download failed: {e}")
 
         print(f"\n{'='*60}")
         print(f"✅ Manual collection completed!")

@@ -76,13 +76,18 @@ def init_db():
             )
         """)
 
-        # Create AI reports cache table
+        # Create AI reports cache table (v1.2.4: Updated for multi-provider support)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ai_reports (
-                user_id TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                report_mode TEXT NOT NULL DEFAULT 'traffic',
+                provider TEXT NOT NULL DEFAULT 'deepseek',
+                model_name TEXT,
                 report_content TEXT NOT NULL,
+                note_covers TEXT,
                 generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                model TEXT,
+                UNIQUE(user_id, report_mode, provider, model_name),
                 FOREIGN KEY (user_id) REFERENCES bloggers(user_id)
             )
         """)
@@ -92,6 +97,72 @@ def init_db():
         try:
             cursor.execute("ALTER TABLE notes ADD COLUMN note_url TEXT")
             print("✓ Added note_url column to notes table")
+        except sqlite3.OperationalError:
+            pass
+
+        # Migrations for v1.2.4
+        # Migrate old ai_reports table to new schema if needed
+        try:
+            # Check if old schema exists (user_id as PRIMARY KEY)
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='ai_reports'")
+            table_sql = cursor.fetchone()[0]
+            if 'user_id TEXT PRIMARY KEY' in table_sql:
+                print("⚠ Migrating ai_reports table to v1.2.4 schema...")
+
+                # Backup old data
+                cursor.execute("ALTER TABLE ai_reports RENAME TO ai_reports_old")
+
+                # Create new table with updated schema
+                cursor.execute("""
+                    CREATE TABLE ai_reports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        report_mode TEXT NOT NULL DEFAULT 'traffic',
+                        provider TEXT NOT NULL DEFAULT 'deepseek',
+                        model_name TEXT,
+                        report_content TEXT NOT NULL,
+                        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(user_id, report_mode, provider, model_name),
+                        FOREIGN KEY (user_id) REFERENCES bloggers(user_id)
+                    )
+                """)
+
+                # Migrate data (assume old reports are deepseek/traffic mode)
+                cursor.execute("""
+                    INSERT INTO ai_reports (user_id, report_mode, provider, model_name, report_content, generated_at)
+                    SELECT user_id, 'traffic', 'deepseek', model, report_content, generated_at
+                    FROM ai_reports_old
+                """)
+
+                # Drop old table
+                cursor.execute("DROP TABLE ai_reports_old")
+                print("✓ ai_reports table migrated to v1.2.4")
+        except Exception as e:
+            pass  # Table doesn't exist yet or migration not needed
+
+        # Add report_mode, provider, model_name columns if old schema without migration
+        try:
+            cursor.execute("ALTER TABLE ai_reports ADD COLUMN report_mode TEXT DEFAULT 'traffic'")
+            print("✓ Added report_mode column to ai_reports table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE ai_reports ADD COLUMN provider TEXT DEFAULT 'deepseek'")
+            print("✓ Added provider column to ai_reports table")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("ALTER TABLE ai_reports ADD COLUMN model_name TEXT")
+            print("✓ Added model_name column to ai_reports table")
+        except sqlite3.OperationalError:
+            pass
+
+        # Add note_covers column for v1.2.11 (封面展示功能)
+        try:
+            cursor.execute("ALTER TABLE ai_reports ADD COLUMN note_covers TEXT")
+            print("✓ Added note_covers column to ai_reports table")
         except sqlite3.OperationalError:
             pass
 
@@ -629,6 +700,22 @@ class NoteDB:
             return False
 
     @staticmethod
+    def update_cover_url(note_id: str, cover_url: str) -> bool:
+        """Update cover URL (用于刷新失效的临时链接)"""
+        try:
+            with get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE notes
+                    SET cover_url = ?
+                    WHERE note_id = ?
+                """, (cover_url, note_id))
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Error updating cover URL for {note_id}: {e}")
+            return False
+
+    @staticmethod
     def get_outlier_notes(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all outlier notes, optionally filtered by user"""
         with get_connection() as conn:
@@ -704,60 +791,22 @@ class NoteDB:
 
 
 class AIReportDB:
-    """Database operations for AI reports cache table"""
+    """Database operations for AI reports cache table (v1.2.4: Multi-provider support)"""
 
     @staticmethod
-    def get_cached_report(user_id: str, ttl_seconds: int = 3600) -> Optional[str]:
+    def save_report(user_id: str, report_file_path: str, report_mode: str = "traffic",
+                    provider: str = "deepseek", model: str = None, note_covers: str = None) -> bool:
         """
-        Get cached AI report if it exists and hasn't expired
+        Save or update AI report metadata to database.
+        Stores file path instead of content — file is the single source of truth.
 
         Args:
             user_id: User ID
-            ttl_seconds: Time-to-live in seconds (default: 1 hour)
-
-        Returns:
-            Cached report content if valid, None otherwise
-        """
-        with get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT report_content, generated_at
-                FROM ai_reports
-                WHERE user_id = ?
-            """, (user_id,))
-            row = cursor.fetchone()
-
-            if not row:
-                return None
-
-            report_content = row[0]
-            generated_at_str = row[1]
-
-            # Parse datetime - SQLite CURRENT_TIMESTAMP format is 'YYYY-MM-DD HH:MM:SS'
-            try:
-                # Replace space with 'T' for ISO format
-                generated_at = datetime.fromisoformat(generated_at_str.replace(' ', 'T'))
-            except:
-                # Fallback: try parsing directly
-                generated_at = datetime.strptime(generated_at_str, '%Y-%m-%d %H:%M:%S')
-
-            # Check if cache is still valid
-            # Note: SQLite CURRENT_TIMESTAMP returns UTC, so we need to use utcnow()
-            age_seconds = (datetime.utcnow() - generated_at).total_seconds()
-            if age_seconds > ttl_seconds:
-                return None  # Cache expired
-
-            return report_content
-
-    @staticmethod
-    def save_report(user_id: str, content: str, model: str) -> bool:
-        """
-        Save or update AI report to cache
-
-        Args:
-            user_id: User ID
-            content: Report content
-            model: AI model used to generate the report
+            report_file_path: Path to the saved report file
+            report_mode: Report mode ("traffic" | "personal")
+            provider: AI provider name ("deepseek" | "kimi")
+            model: AI model name
+            note_covers: JSON string containing note cover information (v1.2.11)
 
         Returns:
             True if successful, False otherwise
@@ -767,21 +816,93 @@ class AIReportDB:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT OR REPLACE INTO ai_reports
-                    (user_id, report_content, generated_at, model)
-                    VALUES (?, ?, CURRENT_TIMESTAMP, ?)
-                """, (user_id, content, model))
+                    (user_id, report_mode, provider, model_name, report_content, note_covers, generated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (user_id, report_mode, provider, model, report_file_path, note_covers))
                 return cursor.rowcount > 0
         except Exception as e:
             print(f"Error saving AI report for {user_id}: {e}")
             return False
 
     @staticmethod
-    def clear_cache(user_id: Optional[str] = None) -> int:
+    def get_report(user_id: str, report_mode: str = "traffic",
+                   provider: str = None, model: str = None) -> Optional[Dict[str, Any]]:
         """
-        Clear AI report cache
+        Get AI report metadata from database
 
         Args:
-            user_id: Optional user ID to clear specific report (None = clear all)
+            user_id: User ID
+            report_mode: Report mode
+            provider: AI provider (None = get any provider)
+            model: AI model (None = get any model)
+
+        Returns:
+            Report dict with keys: report_file_path, provider, model_name, note_covers, generated_at
+        """
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Build query based on parameters
+            if provider and model:
+                cursor.execute("""
+                    SELECT report_content AS report_file_path, provider, model_name, note_covers, generated_at
+                    FROM ai_reports
+                    WHERE user_id = ? AND report_mode = ? AND provider = ? AND model_name = ?
+                """, (user_id, report_mode, provider, model))
+            elif provider:
+                cursor.execute("""
+                    SELECT report_content AS report_file_path, provider, model_name, note_covers, generated_at
+                    FROM ai_reports
+                    WHERE user_id = ? AND report_mode = ? AND provider = ?
+                    ORDER BY generated_at DESC
+                    LIMIT 1
+                """, (user_id, report_mode, provider))
+            else:
+                cursor.execute("""
+                    SELECT report_content AS report_file_path, provider, model_name, note_covers, generated_at
+                    FROM ai_reports
+                    WHERE user_id = ? AND report_mode = ?
+                    ORDER BY generated_at DESC
+                    LIMIT 1
+                """, (user_id, report_mode))
+
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def get_reports_by_user(user_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all reports for a specific user
+
+        Args:
+            user_id: User ID
+
+        Returns:
+            List of report info dicts with keys:
+            report_mode, provider, model_name, generated_at, report_file_path, note_covers
+        """
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT report_mode, provider, model_name, generated_at,
+                       report_content AS report_file_path, note_covers
+                FROM ai_reports
+                WHERE user_id = ?
+                ORDER BY generated_at DESC
+            """, (user_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def delete_report(user_id: str, report_mode: str = None,
+                      provider: str = None, model: str = None) -> int:
+        """
+        Delete AI report(s)
+
+        Args:
+            user_id: User ID
+            report_mode: Report mode (None = delete all modes)
+            provider: Provider (None = delete all providers)
+            model: Model (None = delete all models)
 
         Returns:
             Number of reports deleted
@@ -789,27 +910,96 @@ class AIReportDB:
         try:
             with get_connection() as conn:
                 cursor = conn.cursor()
-                if user_id:
-                    cursor.execute("DELETE FROM ai_reports WHERE user_id = ?", (user_id,))
+
+                # Build DELETE query based on parameters
+                if report_mode and provider and model:
+                    cursor.execute("""
+                        DELETE FROM ai_reports
+                        WHERE user_id = ? AND report_mode = ? AND provider = ? AND model_name = ?
+                    """, (user_id, report_mode, provider, model))
+                elif report_mode and provider:
+                    cursor.execute("""
+                        DELETE FROM ai_reports
+                        WHERE user_id = ? AND report_mode = ? AND provider = ?
+                    """, (user_id, report_mode, provider))
+                elif report_mode:
+                    cursor.execute("""
+                        DELETE FROM ai_reports
+                        WHERE user_id = ? AND report_mode = ?
+                    """, (user_id, report_mode))
                 else:
-                    cursor.execute("DELETE FROM ai_reports")
+                    cursor.execute("""
+                        DELETE FROM ai_reports
+                        WHERE user_id = ?
+                    """, (user_id,))
+
                 return cursor.rowcount
         except Exception as e:
-            print(f"Error clearing AI report cache: {e}")
+            print(f"Error deleting AI report: {e}")
             return 0
 
     @staticmethod
-    def get_all_cached_reports() -> List[Dict[str, Any]]:
-        """Get all cached reports"""
+    def get_all_reports() -> List[Dict[str, Any]]:
+        """Get all cached reports with blogger info"""
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT ar.user_id, ar.model, ar.generated_at, b.nickname
+                SELECT ar.user_id, ar.report_mode, ar.provider, ar.model_name,
+                       ar.generated_at, ar.note_covers, b.nickname
                 FROM ai_reports ar
                 LEFT JOIN bloggers b ON ar.user_id = b.user_id
                 ORDER BY ar.generated_at DESC
             """)
             return [dict(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def clear_all() -> int:
+        """Clear all AI reports from database"""
+        try:
+            with get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM ai_reports")
+                return cursor.rowcount
+        except Exception as e:
+            print(f"Error clearing AI reports: {e}")
+            return 0
+
+    # Legacy methods for backward compatibility
+    @staticmethod
+    def get_cached_report(user_id: str, ttl_seconds: int = 3600) -> Optional[str]:
+        """
+        (Legacy) Get cached AI report - for backward compatibility
+
+        New code should use get_report() instead
+        """
+        report = AIReportDB.get_report(user_id, report_mode="traffic")
+        if not report:
+            return None
+
+        # Check TTL
+        try:
+            generated_at_str = report['generated_at']
+            generated_at = datetime.fromisoformat(generated_at_str.replace(' ', 'T'))
+            age_seconds = (datetime.utcnow() - generated_at).total_seconds()
+            if age_seconds > ttl_seconds:
+                return None
+        except:
+            pass
+
+        return report['report_content']
+
+    @staticmethod
+    def clear_cache(user_id: Optional[str] = None) -> int:
+        """(Legacy) Clear cache - for backward compatibility"""
+        if user_id:
+            return AIReportDB.delete_report(user_id)
+        else:
+            return AIReportDB.clear_all()
+
+    @staticmethod
+    def get_all_cached_reports() -> List[Dict[str, Any]]:
+        """(Legacy) Get all reports - for backward compatibility"""
+        return AIReportDB.get_all_reports()
 
 
 if __name__ == "__main__":

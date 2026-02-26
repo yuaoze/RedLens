@@ -15,7 +15,7 @@ from datetime import datetime
 MEDIA_CRAWLER_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(MEDIA_CRAWLER_ROOT))
 
-from red_lens.db import BloggerDB, NoteDB, init_db
+from red_lens.db import BloggerDB, NoteDB, AIReportDB, init_db
 
 
 # Directory for storing cover images
@@ -147,7 +147,7 @@ def download_cover_image(note_id: str, cover_url: str, overwrite: bool = False) 
         overwrite: Whether to overwrite existing file
 
     Returns:
-        Local file path if successful, None otherwise
+        Absolute local file path if successful, None otherwise
     """
     if not cover_url:
         print(f"  ⚠ No cover URL for note {note_id}")
@@ -165,7 +165,8 @@ def download_cover_image(note_id: str, cover_url: str, overwrite: bool = False) 
     # Check if already exists
     if local_path.exists() and not overwrite:
         print(f"  ✓ Cover already exists: {local_path.name}")
-        return str(local_path)
+        # Return absolute path
+        return str(local_path.resolve())
 
     try:
         # Download image
@@ -177,20 +178,22 @@ def download_cover_image(note_id: str, cover_url: str, overwrite: bool = False) 
             f.write(response.content)
 
         print(f"  ✓ Downloaded cover: {local_path.name}")
-        return str(local_path)
+        # Return absolute path
+        return str(local_path.resolve())
 
     except Exception as e:
         print(f"  ✗ Failed to download cover for {note_id}: {e}")
         return None
 
 
-def download_outlier_covers(user_id: Optional[str] = None, overwrite: bool = False) -> int:
+def download_outlier_covers(user_id: Optional[str] = None, overwrite: bool = False, refresh_url: bool = True) -> int:
     """
     Download cover images for all outlier notes
 
     Args:
         user_id: Optional user ID to filter (if None, download for all users)
         overwrite: Whether to overwrite existing files
+        refresh_url: Whether to refresh cover URLs if download fails (default: True)
 
     Returns:
         Number of covers successfully downloaded
@@ -200,6 +203,7 @@ def download_outlier_covers(user_id: Optional[str] = None, overwrite: bool = Fal
     print(f"{'='*60}")
     print(f"Target: {'All users' if not user_id else f'User {user_id}'}")
     print(f"Save directory: {COVER_DIR}")
+    print(f"Refresh URL on failure: {'Yes' if refresh_url else 'No'}")
     print(f"{'='*60}\n")
 
     outlier_notes = NoteDB.get_outlier_notes(user_id=user_id)
@@ -211,18 +215,61 @@ def download_outlier_covers(user_id: Optional[str] = None, overwrite: bool = Fal
     print(f"📥 Found {len(outlier_notes)} outlier note(s) to download")
 
     downloaded = 0
+    failed_notes = []
+
     for note in outlier_notes:
         note_id = note["note_id"]
         cover_url = note["cover_url"]
 
         print(f"\n📷 {note['title'][:30]}... (Likes: {note['likes']:,})")
 
+        # Try to download with current URL
         local_path = download_cover_image(note_id, cover_url, overwrite=overwrite)
 
         if local_path:
             # Update database with local path
             NoteDB.update_local_cover_path(note_id, local_path)
             downloaded += 1
+        else:
+            # Download failed, record for potential URL refresh
+            failed_notes.append(note)
+
+    # If refresh_url is enabled and there are failed downloads, try to refresh URLs
+    if refresh_url and failed_notes:
+        print(f"\n{'='*60}")
+        print(f"⚠️  {len(failed_notes)} downloads failed, attempting to refresh cover URLs...")
+        print(f"{'='*60}\n")
+
+        # Import refresh function (avoid circular import by importing here)
+        try:
+            from red_lens.pipeline import refresh_note_cover_urls
+
+            failed_note_ids = [n["note_id"] for n in failed_notes]
+            refresh_result = refresh_note_cover_urls(failed_note_ids)
+
+            if refresh_result.get("success") and refresh_result.get("updated", 0) > 0:
+                print(f"\n✓ Refreshed {refresh_result['updated']} cover URLs, retrying downloads...")
+
+                # Retry downloads for refreshed notes
+                for note_id in failed_note_ids:
+                    # Get updated note from database
+                    updated_note = NoteDB.get_note(note_id)
+                    if updated_note and updated_note.get("cover_url"):
+                        print(f"\n📷 Retry: {updated_note['title'][:30]}...")
+                        local_path = download_cover_image(
+                            note_id,
+                            updated_note["cover_url"],
+                            overwrite=overwrite
+                        )
+                        if local_path:
+                            NoteDB.update_local_cover_path(note_id, local_path)
+                            downloaded += 1
+                            print(f"  ✓ Download succeeded after URL refresh")
+            else:
+                print(f"⚠️  URL refresh failed or no URLs were updated")
+
+        except Exception as e:
+            print(f"⚠️  Failed to refresh URLs: {e}")
 
     print(f"\n{'='*60}")
     print(f"✓ Download completed!")
@@ -234,21 +281,29 @@ def download_outlier_covers(user_id: Optional[str] = None, overwrite: bool = Fal
     return downloaded
 
 
-def get_report_file_path(user_id: str, report_mode: str = "traffic") -> Path:
+def get_report_file_path(user_id: str, report_mode: str = "traffic", provider: str = None, model: str = None) -> Path:
     """
     Get the file path for a user's AI report
 
     Args:
         user_id: User ID
         report_mode: Report mode - "traffic" or "personal"
+        provider: AI provider name (e.g., "deepseek", "kimi")
+        model: Model name (for distinguishing different model reports)
 
     Returns:
         Path object for the report file
     """
-    return REPORTS_DIR / f"{user_id}_{report_mode}_report.md"
+    if provider and model:
+        # New format: user_id_reportmode_provider_modelshort.md
+        model_short = model.split('-')[-1]  # e.g., "vision" from "kimi-k2.5"
+        return REPORTS_DIR / f"{user_id}_{report_mode}_{provider}_{model_short}.md"
+    else:
+        # Legacy format for backward compatibility
+        return REPORTS_DIR / f"{user_id}_{report_mode}_report.md"
 
 
-def save_report_to_file(user_id: str, report: str, report_mode: str = "traffic") -> bool:
+def save_report_to_file(user_id: str, report: str, report_mode: str = "traffic", provider: str = None, model: str = None) -> Optional[str]:
     """
     Save AI report to file
 
@@ -256,34 +311,38 @@ def save_report_to_file(user_id: str, report: str, report_mode: str = "traffic")
         user_id: User ID
         report: Report content
         report_mode: Report mode - "traffic" or "personal"
+        provider: AI provider name
+        model: Model name
 
     Returns:
-        True if successful, False otherwise
+        File path string if successful, None otherwise
     """
     try:
-        report_file = get_report_file_path(user_id, report_mode)
+        report_file = get_report_file_path(user_id, report_mode, provider, model)
         with open(report_file, 'w', encoding='utf-8') as f:
             f.write(report)
         print(f"  ✓ Report saved to: {report_file.name}")
-        return True
+        return str(report_file)
     except Exception as e:
         print(f"  ✗ Failed to save report: {e}")
-        return False
+        return None
 
 
-def load_report_from_file(user_id: str, report_mode: str = "traffic") -> Optional[str]:
+def load_report_from_file(user_id: str, report_mode: str = "traffic", provider: str = None, model: str = None) -> Optional[str]:
     """
     Load AI report from file
 
     Args:
         user_id: User ID
         report_mode: Report mode - "traffic" or "personal"
+        provider: AI provider name
+        model: Model name
 
     Returns:
         Report content if exists, None otherwise
     """
     try:
-        report_file = get_report_file_path(user_id, report_mode)
+        report_file = get_report_file_path(user_id, report_mode, provider, model)
         if report_file.exists():
             with open(report_file, 'r', encoding='utf-8') as f:
                 return f.read()
@@ -293,33 +352,37 @@ def load_report_from_file(user_id: str, report_mode: str = "traffic") -> Optiona
         return None
 
 
-def report_exists(user_id: str, report_mode: str = "traffic") -> bool:
+def report_exists(user_id: str, report_mode: str = "traffic", provider: str = None, model: str = None) -> bool:
     """
     Check if AI report exists for a user
 
     Args:
         user_id: User ID
         report_mode: Report mode - "traffic" or "personal"
+        provider: AI provider name
+        model: Model name
 
     Returns:
         True if report exists, False otherwise
     """
-    return get_report_file_path(user_id, report_mode).exists()
+    return get_report_file_path(user_id, report_mode, provider, model).exists()
 
 
-def delete_report_file(user_id: str, report_mode: str = "traffic") -> bool:
+def delete_report_file(user_id: str, report_mode: str = "traffic", provider: str = None, model: str = None) -> bool:
     """
     Delete AI report file for a user
 
     Args:
         user_id: User ID
         report_mode: Report mode - "traffic" or "personal"
+        provider: AI provider name
+        model: Model name
 
     Returns:
         True if deleted, False otherwise
     """
     try:
-        report_file = get_report_file_path(user_id, report_mode)
+        report_file = get_report_file_path(user_id, report_mode, provider, model)
         if report_file.exists():
             report_file.unlink()
             print(f"  ✓ Report deleted: {report_file.name}")
@@ -330,15 +393,299 @@ def delete_report_file(user_id: str, report_mode: str = "traffic") -> bool:
         return False
 
 
-def generate_ai_report(user_id: str, use_mock: bool = True, force_regenerate: bool = False, report_mode: str = "traffic") -> str:
+def _clean_markdown_code_blocks(content: str) -> str:
     """
-    Generate AI insights report for a blogger
+    Clean markdown code blocks from AI response
+
+    Some AI models (like KIMI) wrap their response in ```markdown``` code blocks,
+    which should be removed for proper rendering.
+
+    Args:
+        content: Raw AI response content
+
+    Returns:
+        Cleaned content without code block markers
+    """
+    import re
+
+    content = content.strip()
+
+    # Pattern 1: Remove ```markdown at the beginning
+    if content.startswith('```markdown'):
+        content = content[len('```markdown'):].lstrip('\n')
+
+    # Pattern 2: Remove ``` at the beginning (if not followed by a language identifier)
+    elif content.startswith('```\n'):
+        content = content[4:]
+
+    # Pattern 3: Remove trailing ```
+    if content.endswith('```'):
+        content = content[:-3].rstrip('\n')
+
+    return content.strip()
+
+
+def download_note_covers(note_ids: List[str], force_redownload: bool = False) -> Dict[str, int]:
+    """
+    Download covers for specified notes
+
+    Args:
+        note_ids: List of note IDs to download covers for
+        force_redownload: If True, redownload even if files exist
+
+    Returns:
+        Dict with download statistics: {'downloaded': count, 'skipped': count, 'failed': count}
+    """
+    from pathlib import Path
+    import requests
+    from PIL import Image
+    from io import BytesIO
+
+    # Create unified covers directory
+    covers_dir = Path(__file__).parent / 'assets' / 'covers'
+    covers_dir.mkdir(parents=True, exist_ok=True)
+
+    stats = {'downloaded': 0, 'skipped': 0, 'failed': 0}
+
+    print(f"  • Downloading {len(note_ids)} note covers...")
+
+    for note_id in note_ids:
+        # Get note from database
+        note = NoteDB.get_note(note_id)
+        if not note:
+            print(f"    ⚠️ Note {note_id} not found in database")
+            stats['failed'] += 1
+            continue
+
+        cover_url = note.get('cover_url')
+        if not cover_url:
+            print(f"    ⚠️ Note {note_id} has no cover_url")
+            stats['failed'] += 1
+            continue
+
+        filename = f"{note_id}.jpg"
+        filepath = covers_dir / filename
+
+        # Skip if exists and not forcing redownload
+        if filepath.exists() and not force_redownload:
+            stats['skipped'] += 1
+            continue
+
+        try:
+            response = requests.get(cover_url, timeout=10)
+            response.raise_for_status()
+
+            # Save image
+            img = Image.open(BytesIO(response.content))
+            # Convert to RGB if needed (in case of RGBA)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+            img.save(filepath, 'JPEG', quality=85, optimize=True)
+
+            stats['downloaded'] += 1
+            print(f"    ✓ Downloaded: {note.get('title', note_id)[:40]}")
+
+        except Exception as e:
+            print(f"    ✗ Failed to download {note_id}: {e}")
+            stats['failed'] += 1
+
+    total = stats['downloaded'] + stats['skipped']
+    print(f"  ✓ Cover download complete: {stats['downloaded']} downloaded + {stats['skipped']} skipped = {total} total")
+
+    if stats['failed'] > 0:
+        print(f"  ⚠️ {stats['failed']} downloads failed")
+
+    return stats
+
+
+def prepare_images_for_ai(notes: List[Dict], max_images: int = None, use_base64: bool = False, user_id: str = None) -> List[Dict]:
+    """
+    Prepare image data for AI vision models
+
+    Args:
+        notes: List of notes to prepare images for
+        max_images: Maximum number of images to prepare (None = prepare for all notes)
+        use_base64: If True, download images and convert to base64 (required for KIMI)
+        user_id: User ID for loading local covers (if provided, will load from red_lens/assets/covers/)
+
+    Returns:
+        List of image data dictionaries with format:
+        - If use_base64=False: [{"type": "url", "data": "https://...", "note_id": "...", "title": "..."}, ...]
+        - If use_base64=True: [{"type": "base64", "data": "base64_string", "mime_type": "image/jpeg", ...}, ...]
+    """
+    images = []
+    target_notes = notes[:max_images] if max_images else notes
+
+    for note in target_notes:
+        cover_url = note.get('cover_url')
+        if not cover_url:
+            continue
+
+        if use_base64:
+            # Try to load from local covers first
+            img_data = None
+            note_id = note.get('note_id', '')
+
+            if user_id:
+                from pathlib import Path
+                covers_dir = Path(__file__).parent / 'assets' / 'covers'
+
+                # Try to find matching cover file (simple note_id.jpg naming)
+                cover_file = covers_dir / f"{note_id}.jpg"
+
+                if cover_file.exists():
+                    try:
+                        with open(cover_file, 'rb') as f:
+                            img_data = f.read()
+                        print(f"    ✓ Loaded from local: {cover_file.name}")
+                    except Exception as e:
+                        print(f"    ⚠️ Failed to load local cover: {e}, falling back to download")
+
+            # If not found locally, download
+            if img_data is None:
+                try:
+                    import requests
+                    import base64
+                    from io import BytesIO
+                    from PIL import Image
+
+                    print(f"  • Downloading image: {note.get('title', '')[:30]}...")
+                    response = requests.get(cover_url, timeout=10)
+                    response.raise_for_status()
+                    img_data = response.content
+
+                except Exception as e:
+                    print(f"    ✗ Failed to download image: {e}")
+                    continue
+
+            # Process image (optimize size)
+            try:
+                import base64
+                from io import BytesIO
+                from PIL import Image
+
+                original_size = len(img_data)
+
+                # If image is too large, resize it
+                MAX_IMAGE_SIZE = 500 * 1024  # 500KB
+                if original_size > MAX_IMAGE_SIZE:
+                    print(f"    ⚠️ Image too large ({original_size / 1024:.1f}KB), resizing...")
+                    try:
+                        img = Image.open(BytesIO(img_data))
+                        # Resize to max 1024px on longest side
+                        max_dimension = 1024
+                        if max(img.size) > max_dimension:
+                            ratio = max_dimension / max(img.size)
+                            new_size = tuple(int(dim * ratio) for dim in img.size)
+                            img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+                        # Save to bytes
+                        output = BytesIO()
+                        img_format = img.format if img.format else 'JPEG'
+                        img.save(output, format=img_format, quality=85, optimize=True)
+                        img_data = output.getvalue()
+                        print(f"    ✓ Resized to {len(img_data) / 1024:.1f}KB")
+                    except Exception as resize_error:
+                        print(f"    ⚠️ Resize failed: {resize_error}, using original")
+
+                # Convert to base64
+                img_base64 = base64.b64encode(img_data).decode('utf-8')
+
+                # Detect content type
+                content_type = 'image/jpeg'  # Default
+                try:
+                    img_obj = Image.open(BytesIO(img_data))
+                    if img_obj.format:
+                        content_type = f'image/{img_obj.format.lower()}'
+                except:
+                    pass
+
+                images.append({
+                    "type": "base64",
+                    "data": img_base64,
+                    "mime_type": content_type,
+                    "note_id": note.get('note_id', ''),
+                    "title": note.get('title', '')[:50]
+                })
+                print(f"    ✓ Encoded to base64 ({len(img_base64)} chars)")
+
+            except Exception as e:
+                print(f"    ✗ Failed to process image: {e}")
+                continue
+        else:
+            # Use URL directly (for other providers)
+            images.append({
+                "type": "url",
+                "data": cover_url,
+                "note_id": note.get('note_id', ''),
+                "title": note.get('title', '')[:50]  # Truncate for logging
+            })
+
+    return images
+
+
+def build_notes_info_with_images(notes: List[Dict], has_images: bool = False, image_note_ids: set = None) -> str:
+    """
+    Build notes information string with optional image annotations
+
+    Args:
+        notes: List of notes
+        has_images: Whether images are actually being passed to the AI model (legacy, applies to all notes)
+        image_note_ids: Set of note_ids that have images prepared. If provided, overrides has_images
+                       for per-note granularity.
+
+    Returns:
+        Formatted notes information string
+    """
+    info = ""
+    for i, note in enumerate(notes, 1):
+        note_id = note.get('note_id', '')
+        # Determine if this specific note has an image
+        if image_note_ids is not None:
+            note_has_image = note_id in image_note_ids
+        else:
+            note_has_image = has_images
+
+        info += f"\n**笔记 {i}**: {note['title']}\n"
+        info += f"  - 数据: 点赞 {note['likes']:,} | 收藏 {note['collects']:,} | 评论 {note.get('comments', 0):,}\n"
+        info += f"  - 类型: {note.get('type', 'image')}\n"
+
+        cover_url = note.get('cover_url')
+        if note_has_image and cover_url:
+            info += f"  - 📷 封面: [图片已附上，请结合视觉分析]\n"
+        elif cover_url:
+            info += f"  - 📷 封面: 有封面但未传递给模型\n"
+        else:
+            info += f"  - 📷 封面: 无\n"
+
+        # Add publish time if available
+        pub_time = note.get('create_time', '') or note.get('publish_time', '')
+        if pub_time:
+            info += f"  - 发布时间: {pub_time}\n"
+
+        info += "\n"
+
+    return info
+
+
+def generate_ai_report(
+    user_id: str,
+    use_mock: bool = True,
+    force_regenerate: bool = False,
+    report_mode: str = "traffic",
+    provider: str = None,
+    model: str = None
+) -> str:
+    """
+    Generate AI insights report for a blogger with multi-provider support
 
     Args:
         user_id: User ID
-        use_mock: If True, return mock report. If False, call Deepseek API
+        use_mock: If True, return mock report. If False, call real AI API
         force_regenerate: If True, regenerate report even if file exists
         report_mode: Report mode - "traffic" for traffic analysis, "personal" for personal review
+        provider: AI provider name ("deepseek" | "kimi" | None for default)
+        model: Model name (None for provider's default model)
 
     Returns:
         AI-generated report text
@@ -346,10 +693,25 @@ def generate_ai_report(user_id: str, use_mock: bool = True, force_regenerate: bo
     # Import config here to avoid circular import
     import config
 
+    # Determine provider and model
+    if not provider:
+        provider = config.DEFAULT_AI_PROVIDER
+    if not model:
+        provider_config = config.AI_PROVIDERS[provider]
+        model = provider_config["default_model"]
+
     print(f"\n{'='*60}")
     print(f"RedLens AI Insights")
     print(f"Mode: {report_mode.upper()}")
+    print(f"Provider: {provider} | Model: {model}")
     print(f"{'='*60}\n")
+
+    # Check if report exists (unless force regenerate or mock mode)
+    if not force_regenerate and not use_mock:
+        existing_report = load_report_from_file(user_id, report_mode, provider, model)
+        if existing_report:
+            print("  ✓ Using existing report from file")
+            return existing_report
 
     analysis = analyze_blogger(user_id)
 
@@ -359,18 +721,11 @@ def generate_ai_report(user_id: str, use_mock: bool = True, force_regenerate: bo
     blogger = analysis["blogger"]
     print(f"🤖 Generating AI insights for: {blogger['nickname']}")
 
-    # Check if report file exists (unless force regenerate)
-    if not force_regenerate:
-        existing_report = load_report_from_file(user_id, report_mode)
-        if existing_report:
-            print("  ✓ Using existing report from file")
-            return existing_report
-
     if use_mock:
-        # Mock AI report for testing
+        # Mock AI report for testing (legacy logic preserved)
         print("  [Using mock AI report]")
 
-        # Get fans count (current_fans or initial_fans)
+        # Get fans count
         fans_count = blogger.get('current_fans', blogger.get('initial_fans', 0))
 
         if report_mode == "personal":
@@ -430,177 +785,256 @@ def generate_ai_report(user_id: str, use_mock: bool = True, force_regenerate: bo
                 report += "**平衡型博主**，兼具审美价值和实用价值。"
 
             report += """
-*   **互动质量**："""
-            avg_comments = analysis['total_comments'] / analysis['total_notes'] if analysis['total_notes'] > 0 else 0
-            if avg_comments < 5:
-                report += "评论区活跃度较低，建议增加与粉丝的互动，提升人设魅力。"
-            else:
-                report += "评论区活跃度良好，粉丝粘性不错。"
+*   **互动质量**：收藏数超过点赞意味着内容被视为"可复用的资产"（工具属性强）；反之则偏向"一次性消费"（情绪/审美体验）。
 
-            report += """
+### 2. 🎬 流量对比复盘
 
-### 2. ⚖️ 成功与失败的复盘
-*   **爆款共性**：Top 10 笔记在标题用词上可能有情绪词、数字、提问等吸引点击的元素，这是你需要坚持的"舒适区"。
-*   **避坑指南**：请分析低分笔记，看看是否存在标题晦涩、选题自嗨或偏离账号核心定位的问题。
+通过对比 Top 10 和 Bottom 5，可以明显看到：
 
-### 3. 🛠️ 内容优化方向 (Action Plan)
-*   **做减法 (Stop Doing)**：请观察低分笔记，找出不要再发的内容类型或标题风格。
-*   **做加法 (Start Doing)**：基于高分笔记，考虑将相似选题系列化或翻拍。
-*   **标题诊所**：建议从笔记中挑选1个，重写3个更具爆款潜力的标题。
+*   **高赞共性**：（由于这是Mock数据，建议使用真实AI调用后查看）
+*   **低赞共性**：封面混乱、标题没有明确价值点、或者与粉丝期望的内容类型不符。
 
-### 4. 🚀 下阶段策略
-*   给出一句话建议：基于藏赞比 """
-            report += f"`{collect_like_ratio:.2f}`"
-            if collect_like_ratio < 0.2:
-                report += "，建议继续强化视觉表现，同时适当增加干货内容提升收藏价值。"
-            elif collect_like_ratio > 0.5:
-                report += "，建议在保持干货质量的同时，提升标题的情绪号召力和视觉吸引力。"
-            else:
-                report += "，建议找到你的差异化优势，在视觉和实用之间找到平衡点。"
+### 3. 📝 下一篇爆文建议
 
-        else:
-            # Traffic analysis mode mock (default)
-            notes = NoteDB.get_notes_by_user(user_id)
+**选题方向**：根据你的高赞笔记，建议下一篇笔记选择类似的风格或选题，并在标题中直接传递价值预期。
 
-            # Calculate avg collects
-            avg_collects = analysis['total_collects'] / analysis['total_notes'] if analysis['total_notes'] > 0 else 0
+**封面建议**：分析高赞笔记的封面风格，保持视觉一致性。
 
-            # Calculate time distribution
-            time_dist = {}
-            for note in notes:
-                create_time = note.get('create_time', '') or note.get('publish_time', '')
-                if create_time:
-                    try:
-                        hour = int(create_time.split(':')[0]) if ':' in str(create_time) else 0
-                        time_dist[hour] = time_dist.get(hour, 0) + 1
-                    except:
-                        pass
+**标题方案 (示例)**：
+1. *痛点型*："还在纠结XX？这篇告诉你答案"
+2. *反差型*："我用了3年才明白，XX其实不是这样的"
+3. *场景型*："那个XX的下午，我拍到了最满意的照片"
 
-            time_distribution = "发布时间主要集中在: " + ", ".join([f"{h}时({c}篇)" for h, c in sorted(time_dist.items(), key=lambda x: x[1], reverse=True)[:5]])
+---
+🤖 Generated by Mock AI | RedLens v1.2.4
+"""
 
-            # Calculate publish frequency
-            if notes:
-                last_publish = notes[0].get('create_time', '') or notes[0].get('publish_time', 'N/A')
-            else:
-                last_publish = "N/A"
-            publish_frequency = f"约 {len(notes) / 30:.1f} 篇/月" if len(notes) >= 30 else f"{len(notes)} 篇总计"
+            # Save report
+            saved_path = save_report_to_file(user_id, report, report_mode, provider, model)
+            if saved_path:
+                AIReportDB.save_report(user_id, saved_path, report_mode, provider, model)
+            return report
+
+        else:  # traffic mode
+            # Traffic analysis mode mock
+            top_outliers = sorted(analysis['outliers'], key=lambda x: x['likes'], reverse=True)[:5]
 
             report = f"""
 # AI 流量拆解报告：{blogger['nickname']}
 
-## 1. 基础画像
-- **昵称**: {blogger['nickname']}
-- **ID**: {user_id}
-- **当前量级**: 粉丝 {fans_count:,} | 笔记 {analysis['total_notes']} 篇
-- **互动大盘**: 平均点赞 {analysis['avg_likes']:.0f} | 平均收藏 {avg_collects:.0f}
+## 📊 基础数据
 
-## 2. 爆款笔记样本 (Top 5)
+- **粉丝数**: {fans_count:,}
+- **笔记数**: {analysis['total_notes']}
+- **平均互动**: 赞 {analysis['avg_likes']:.0f}
+- **爆款率**: {analysis['outlier_rate']:.1%}
+
+## 🔥 爆款笔记 (Top 5)
 """
+            for i, note in enumerate(top_outliers, 1):
+                report += f"\n{i}. **{note['title']}**\n"
+                report += f"   - 点赞: {note['likes']:,} | 收藏: {note['collects']:,}\n"
 
-            if analysis['outliers']:
-                top_5_notes = sorted(analysis['outliers'], key=lambda x: x['likes'], reverse=True)[:5]
-                for i, note in enumerate(top_5_notes, 1):
-                    report += f"\n{i}. **{note['title']}**\n"
-                    report += f"   - 点赞: {note['likes']:,} | 收藏: {note['collects']:,} | 评论: {note['comments']:,}\n"
-                    pub_time = note.get('create_time', '') or note.get('publish_time', 'N/A')
-                    report += f"   - 发布时间: {pub_time}\n"
-            else:
-                # If no outliers, use top notes by likes
-                all_notes_sorted = sorted(notes, key=lambda x: x['likes'], reverse=True)[:5]
-                for i, note in enumerate(all_notes_sorted, 1):
-                    report += f"\n{i}. **{note['title']}**\n"
-                    report += f"   - 点赞: {note['likes']:,} | 收藏: {note['collects']:,} | 评论: {note['comments']:,}\n"
-                    pub_time = note.get('create_time', '') or note.get('publish_time', 'N/A')
-                    report += f"   - 发布时间: {pub_time}\n"
+            report += """
 
-            report += f"""
+## 🧬 流量密码分析
 
-## 3. 时间与频率
-- 最近发布: {last_publish}
-- 发布频率: {publish_frequency}
-- 时间分布: {time_distribution}
+### 1. 成长路径诊断
+*   （Mock数据模式，使用真实AI后将提供详细分析）
+
+### 2. 流量机制推演
+*   **搜索流 vs 推荐流**：根据标题关键词分析，该账号主要依靠推荐流量。
+
+### 3. 优化建议
+*   保持高赞笔记的风格和选题
+*   标题可以更加突出价值点
 
 ---
-
-## 🕵️‍♂️ 深度分析
-
-### 1. 📈 成长路径与人设定位
-*   **账号定位判定**：基于数据表现，该博主是**审美/情绪博主**（观赏属性），内容偏重视觉呈现和情绪共鸣。
-*   **成长阶段判断**：根据互动数据，该账号处于**稳定增长期**，建议维持内容质量的同时尝试新的内容形式。
-*   **人设记忆点**：从爆款标题中可以提取出其最具吸引力的标签是"摄影+场景+情绪"的组合拳。
-
-### 2. 🧬 流量密码拆解
-*   **爆文基因**：Top 笔记的共性是靠**特定场景**（如独特时间、地点的氛围感）和**情绪共鸣**，而非纯技术参数。
-*   **触达机制推演**：
-    *   *搜索侧*：标题中较少包含器材型号等强搜索词，说明流量主要来自推荐流。
-    *   *推荐侧*：标题包含情绪词和强烈的视觉描述，容易被推荐算法捕捉。
-*   **低粉爆文特征**：存在点赞数远超粉丝数预期的笔记，说明内容击中了算法推荐机制。
-
-### 3. 🎨 摄影垂直风格分析
-*   **视觉关键词**：胶片感、街拍、蓝调、氛围感、扫街
-*   **选题偏好**：更倾向于街头摄影和情绪化场景
-
-### 4. 🚀 策略复盘与建议
-*   **All-in方向**：继续强化"场景+情绪"的内容模式
-*   **砍掉内容**：减少纯技术参数分享类内容
-
-### 5. ⚠️ 总结
-这个博主能火的核心逻辑：**用有氛围感的场景照片击中用户的情绪共鸣点**
-
----
-🤖 Generated by Mock AI | RedLens v1.2.2
+🤖 Generated by Mock AI | RedLens v1.2.11
 """
 
-        # Save report to file
-        save_report_to_file(user_id, report, report_mode)
+            # Collect note cover information for Mock mode (v1.2.11)
+            import json
+            note_covers_data = {
+                "report_mode": report_mode,
+                "covers": []
+            }
 
-        return report
+            if report_mode == "traffic":
+                # 流量拆解模式：收集Top 5爆款封面
+                top_outliers = sorted(analysis['outliers'], key=lambda x: x['likes'], reverse=True)[:5]
+                for note in top_outliers:
+                    note_id = note.get('note_id', '')
+                    local_cover = note.get('local_cover_path', '')
+                    if local_cover:
+                        note_covers_data["covers"].append({
+                            "note_id": note_id,
+                            "title": note.get('title', '')[:50],
+                            "local_cover_path": local_cover,
+                            "likes": note.get('likes', 0),
+                            "category": "top5"
+                        })
+            else:  # personal mode
+                # 个人复盘模式：收集Top 10和Bottom 5封面
+                for note in top_10_notes:
+                    note_id = note.get('note_id', '')
+                    local_cover = note.get('local_cover_path', '')
+                    if local_cover:
+                        note_covers_data["covers"].append({
+                            "note_id": note_id,
+                            "title": note.get('title', '')[:50],
+                            "local_cover_path": local_cover,
+                            "likes": note.get('likes', 0),
+                            "category": "top10"
+                        })
+
+                for note in bottom_5_notes:
+                    note_id = note.get('note_id', '')
+                    local_cover = note.get('local_cover_path', '')
+                    if local_cover:
+                        note_covers_data["covers"].append({
+                            "note_id": note_id,
+                            "title": note.get('title', '')[:50],
+                            "local_cover_path": local_cover,
+                            "likes": note.get('likes', 0),
+                            "category": "bottom5"
+                        })
+
+            note_covers_json = json.dumps(note_covers_data, ensure_ascii=False)
+
+            saved_path = save_report_to_file(user_id, report, report_mode, provider, model)
+            if saved_path:
+                AIReportDB.save_report(user_id, saved_path, report_mode, provider, model, note_covers_json)
+            return report
 
     else:
-        # Real Deepseek API call
-        print("  [Calling Deepseek API...]")
+        # Real AI API call with multi-provider support
+        print("  [Calling AI API...]")
 
         try:
-            from openai import OpenAI
+            from red_lens.ai_providers import get_ai_provider
 
-            # Check API key
-            if not config.DEEPSEEK_API_KEY:
-                return "Error: DEEPSEEK_API_KEY not configured. Please set the environment variable or configure it in config/ai_config.py"
+            # Get AI provider instance
+            ai_provider = get_ai_provider(provider, model)
 
-            # Get fans count
+            # Check if provider supports vision
+            supports_vision = ai_provider.supports_vision()
+            print(f"  • Vision support: {'✓' if supports_vision else '✗'}")
+
+            # Get blogger data
             fans_count = blogger.get('current_fans', blogger.get('initial_fans', 0))
-
-            # Prepare data for prompt
             notes = NoteDB.get_notes_by_user(user_id)
 
-            # Get top outliers for analysis
-            top_outliers = sorted(analysis['outliers'], key=lambda x: x['likes'], reverse=True)[:5]
+            # ===== Determine which notes need covers based on report mode =====
+            all_notes_sorted = sorted(notes, key=lambda x: x['likes'], reverse=True)
 
-            # Select system and user prompt based on report mode
             if report_mode == "personal":
-                system_prompt = config.AI_SYSTEM_PROMPT_PERSONAL
-                user_prompt_template = config.AI_USER_PROMPT_TEMPLATE_PERSONAL
-
-                # For personal mode: need Top 10 and Bottom 5 notes
-                all_notes_sorted = sorted(notes, key=lambda x: x['likes'], reverse=True)
-
-                # Top 10 notes
+                # Personal mode: top 10 + bottom 5
                 top_10_notes = all_notes_sorted[:10]
-                top_notes_info = ""
-                for i, note in enumerate(top_10_notes, 1):
-                    top_notes_info += f"\n{i}. **{note['title']}**\n"
-                    top_notes_info += f"   - 点赞: {note['likes']:,} | 收藏: {note['collects']:,} | 评论: {note['comments']:,}\n"
-
-                # Bottom 5 notes: select the 5 notes with minimum likes among those with >= 20 likes
                 notes_likes_20plus = [note for note in notes if note['likes'] >= 20]
-                notes_likes_20plus_sorted = sorted(notes_likes_20plus, key=lambda x: x['likes'])  # ascending
-                bottom_5_notes = notes_likes_20plus_sorted[:5]  # first 5 = lowest among >= 20
-                bottom_notes_info = ""
-                for i, note in enumerate(bottom_5_notes, 1):
-                    bottom_notes_info += f"\n{i}. **{note['title']}**\n"
-                    bottom_notes_info += f"   - 点赞: {note['likes']:,} | 收藏: {note['collects']:,} | 评论: {note['comments']:,}\n"
+                notes_likes_20plus_sorted = sorted(notes_likes_20plus, key=lambda x: x['likes'])
+                bottom_5_notes = notes_likes_20plus_sorted[:5]
+                # Combine: all notes that need covers (dedup by note_id)
+                seen_ids = set()
+                notes_needing_covers = []
+                for note in top_10_notes + bottom_5_notes:
+                    if note['note_id'] not in seen_ids:
+                        seen_ids.add(note['note_id'])
+                        notes_needing_covers.append(note)
+            else:
+                # Traffic mode: top 5 outliers
+                top_outliers = sorted(analysis['outliers'], key=lambda x: x['likes'], reverse=True)[:5]
+                notes_needing_covers = top_outliers
 
-                # Calculate collect-like ratio
+            # ===== Auto-download covers if vision is supported =====
+            if supports_vision and notes_needing_covers:
+                print(f"  • Checking cover availability for {len(notes_needing_covers)} notes...")
+                from pathlib import Path
+
+                covers_dir = Path(__file__).parent / 'assets' / 'covers'
+
+                # Check which covers are missing
+                missing_covers = []
+                for note in notes_needing_covers:
+                    note_id = note['note_id']
+                    cover_file = covers_dir / f"{note_id}.jpg"
+                    if not cover_file.exists():
+                        missing_covers.append(note_id)
+
+                # If any covers are missing, auto-download
+                if missing_covers:
+                    print(f"  ⚠️ Missing {len(missing_covers)} covers, auto-downloading...")
+
+                    try:
+                        from red_lens.pipeline import refresh_note_cover_urls
+
+                        note_ids_to_download = [note['note_id'] for note in notes_needing_covers]
+
+                        # Step 1: Refresh cover URLs
+                        print(f"    • Step 1/2: Refreshing cover URLs...")
+                        refresh_result = refresh_note_cover_urls(note_ids_to_download)
+
+                        if refresh_result.get('success'):
+                            print(f"    ✓ Refreshed {refresh_result.get('updated', 0)} note URLs")
+                        else:
+                            print(f"    ⚠️ URL refresh had issues, attempting download anyway...")
+
+                        # Step 2: Download covers
+                        print(f"    • Step 2/2: Downloading covers...")
+                        download_stats = download_note_covers(note_ids_to_download, force_redownload=False)
+                        print(f"    ✓ Downloaded: {download_stats['downloaded']}, Skipped: {download_stats['skipped']}, Failed: {download_stats['failed']}")
+
+                        # Reload notes to get updated cover_url after refresh
+                        notes = NoteDB.get_notes_by_user(user_id)
+                        all_notes_sorted = sorted(notes, key=lambda x: x['likes'], reverse=True)
+                        if report_mode == "personal":
+                            top_10_notes = all_notes_sorted[:10]
+                            notes_likes_20plus = [note for note in notes if note['likes'] >= 20]
+                            notes_likes_20plus_sorted = sorted(notes_likes_20plus, key=lambda x: x['likes'])
+                            bottom_5_notes = notes_likes_20plus_sorted[:5]
+                            seen_ids = set()
+                            notes_needing_covers = []
+                            for note in top_10_notes + bottom_5_notes:
+                                if note['note_id'] not in seen_ids:
+                                    seen_ids.add(note['note_id'])
+                                    notes_needing_covers.append(note)
+                        else:
+                            top_outliers = sorted(analysis['outliers'], key=lambda x: x['likes'], reverse=True)[:5]
+                            notes_needing_covers = top_outliers
+
+                    except Exception as e:
+                        print(f"    ✗ Auto-download failed: {e}")
+                        print(f"    • Continuing with available data...")
+                else:
+                    print(f"  ✓ All required covers exist")
+
+            # ===== Prepare images if vision is supported =====
+            images = []
+            image_note_ids = set()  # Track which note_ids have images prepared
+            if supports_vision:
+                use_base64 = (provider == "kimi")
+                # Prepare images for all notes that need covers
+                images = prepare_images_for_ai(notes_needing_covers, use_base64=use_base64, user_id=user_id)
+
+                if images:
+                    image_note_ids = {img['note_id'] for img in images}
+                    img_format = "base64" if use_base64 else "URL"
+                    print(f"  • Prepared {len(images)} cover images ({img_format} format)")
+
+            # Select prompts based on mode and vision support
+            if report_mode == "personal":
+                if supports_vision:
+                    system_prompt = config.AI_SYSTEM_PROMPT_PERSONAL_VISION
+                    user_prompt_template = config.AI_USER_PROMPT_TEMPLATE_PERSONAL_VISION
+                else:
+                    system_prompt = config.AI_SYSTEM_PROMPT_PERSONAL
+                    user_prompt_template = config.AI_USER_PROMPT_TEMPLATE_PERSONAL
+
+                # Build notes info with per-note image tracking
+                top_notes_info = build_notes_info_with_images(top_10_notes, image_note_ids=image_note_ids if images else None)
+                bottom_notes_info = build_notes_info_with_images(bottom_5_notes, image_note_ids=image_note_ids if images else None)
+
+                # Calculate metrics
                 total_likes = sum(note["likes"] for note in notes)
                 total_collects = sum(note["collects"] for note in notes)
                 collect_like_ratio = total_collects / total_likes if total_likes > 0 else 0
@@ -616,17 +1050,18 @@ def generate_ai_report(user_id: str, use_mock: bool = True, force_regenerate: bo
                     bottom_notes_info=bottom_notes_info
                 )
 
-            else:  # traffic mode (default)
-                system_prompt = config.AI_SYSTEM_PROMPT_TRAFFIC
-                user_prompt_template = config.AI_USER_PROMPT_TEMPLATE_TRAFFIC
+            else:  # traffic mode
+                if supports_vision:
+                    system_prompt = config.AI_SYSTEM_PROMPT_TRAFFIC_VISION
+                    user_prompt_template = config.AI_USER_PROMPT_TEMPLATE_TRAFFIC_VISION
+                else:
+                    system_prompt = config.AI_SYSTEM_PROMPT_TRAFFIC
+                    user_prompt_template = config.AI_USER_PROMPT_TEMPLATE_TRAFFIC
 
-                # Format top notes info with titles (no cover URLs as Deepseek doesn't support vision)
-                top_notes_info = ""
-                for i, note in enumerate(top_outliers, 1):
-                    top_notes_info += f"\n{i}. **{note['title']}**\n"
-                    top_notes_info += f"   - 点赞: {note['likes']:,} | 收藏: {note['collects']:,} | 评论: {note['comments']:,}\n"
-                    top_notes_info += f"   - 类型: {note['type']}\n"
-                    top_notes_info += f"   - 发布时间: {note.get('create_time', '') or note.get('publish_time', 'N/A')}\n"
+                # top_outliers already prepared above during cover selection
+
+                # Build notes info with per-note image tracking
+                top_notes_info = build_notes_info_with_images(top_outliers, image_note_ids=image_note_ids if images else None, has_images=bool(images))
 
                 # Calculate time distribution
                 time_dist = {}
@@ -648,9 +1083,9 @@ def generate_ai_report(user_id: str, use_mock: bool = True, force_regenerate: bo
                     last_publish = "N/A"
                 publish_frequency = f"约 {len(notes) / 30:.1f} 篇/月" if len(notes) >= 30 else f"{len(notes)} 篇总计"
 
-                # Calculate interaction rate (avoid division by zero)
+                # Calculate interaction rate
                 total_interactions = analysis['avg_likes'] + (analysis['total_collects'] / analysis['total_notes'] if analysis['total_notes'] > 0 else 0) + (analysis['total_comments'] / analysis['total_notes'] if analysis['total_notes'] > 0 else 0)
-                interaction_rate = (total_interactions / fans_count * 100) if fans_count > 0 else 0
+                interaction_rate = (total_interactions / fans_count) if fans_count > 0 else 0
 
                 user_prompt = user_prompt_template.format(
                     nickname=blogger['nickname'],
@@ -665,49 +1100,117 @@ def generate_ai_report(user_id: str, use_mock: bool = True, force_regenerate: bo
                     publish_frequency=publish_frequency,
                     top_n=len(top_outliers),
                     top_notes_info=top_notes_info,
+                    top_notes_info_with_images=top_notes_info,  # Alias for compatibility
                     time_distribution=time_distribution
                 )
 
-            # Call Deepseek API
-            client = OpenAI(
-                api_key=config.DEEPSEEK_API_KEY,
-                base_url=config.DEEPSEEK_BASE_URL
-            )
+            # Build messages
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
 
-            print(f"  • Model: {config.AI_MODEL}")
-            print(f"  • Max tokens: {config.AI_MAX_TOKENS}")
+            # Select timeout based on provider (KIMI needs more time for images)
+            timeout = config.AI_REQUEST_TIMEOUT_KIMI if provider == "kimi" else config.AI_REQUEST_TIMEOUT
+            print(f"  • Request timeout: {timeout}s")
 
-            response = client.chat.completions.create(
-                model=config.AI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
+            # Call AI provider
+            print("  • Sending request to AI...")
+            report_content = ai_provider.generate_report(
+                messages=messages,
+                images=images if supports_vision else None,
                 max_tokens=config.AI_MAX_TOKENS,
                 temperature=config.AI_TEMPERATURE,
-                timeout=config.AI_REQUEST_TIMEOUT
+                timeout=timeout
             )
 
-            report_content = response.choices[0].message.content
+            # Clean markdown code blocks (KIMI sometimes wraps response in ```markdown```)
+            report_content = _clean_markdown_code_blocks(report_content)
 
-            # Add header and footer
-            report = f"# AI 洞察报告：{blogger['nickname']}\n\n"
-            report += report_content
-            report += f"\n\n---\n🤖 Generated by Deepseek AI ({config.AI_MODEL}) | RedLens v1.2.2"
+            # Build full report with header
+            report_header = f"# 📊 {blogger['nickname']} - {'流量拆解' if report_mode == 'traffic' else '个人复盘'}报告\n\n"
+            report_header += f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            report_header += f"**AI模型**: {ai_provider.get_provider_name()} ({model})\n"
+            if supports_vision and images:
+                report_header += f"**视觉分析**: 已分析 {len(images)} 张封面图片\n"
+            report_header += "\n---\n\n"
 
-            # Save report to file
-            save_report_to_file(user_id, report, report_mode)
+            full_report = report_header + report_content
+
+            # Add footer
+            full_report += f"\n\n---\n🤖 Generated by {ai_provider.get_provider_name()} ({model}) | RedLens v1.2.11"
+
+            # Collect note cover information (v1.2.11)
+            import json
+            note_covers_data = {
+                "report_mode": report_mode,
+                "covers": []
+            }
+
+            if report_mode == "traffic":
+                # 流量拆解模式：收集Top 5爆款封面
+                for note in notes_needing_covers[:5]:
+                    note_id = note.get('note_id', '')
+                    local_cover = note.get('local_cover_path', '')
+                    if local_cover:
+                        note_covers_data["covers"].append({
+                            "note_id": note_id,
+                            "title": note.get('title', '')[:50],
+                            "local_cover_path": local_cover,
+                            "likes": note.get('likes', 0),
+                            "category": "top5"
+                        })
+            else:  # personal mode
+                # 个人复盘模式：收集Top 10和Bottom 5封面
+                for note in top_10_notes:
+                    note_id = note.get('note_id', '')
+                    local_cover = note.get('local_cover_path', '')
+                    if local_cover:
+                        note_covers_data["covers"].append({
+                            "note_id": note_id,
+                            "title": note.get('title', '')[:50],
+                            "local_cover_path": local_cover,
+                            "likes": note.get('likes', 0),
+                            "category": "top10"
+                        })
+
+                for note in bottom_5_notes:
+                    note_id = note.get('note_id', '')
+                    local_cover = note.get('local_cover_path', '')
+                    if local_cover:
+                        note_covers_data["covers"].append({
+                            "note_id": note_id,
+                            "title": note.get('title', '')[:50],
+                            "local_cover_path": local_cover,
+                            "likes": note.get('likes', 0),
+                            "category": "bottom5"
+                        })
+
+            note_covers_json = json.dumps(note_covers_data, ensure_ascii=False)
+
+            # Save report
+            saved_path = save_report_to_file(user_id, full_report, report_mode, provider, model)
+            if saved_path:
+                AIReportDB.save_report(user_id, saved_path, report_mode, provider, model, note_covers_json)
 
             print("  ✓ AI report generated successfully")
+            return full_report
 
-            return report
+        except ValueError as e:
+            # Configuration errors (API key missing, unknown provider, etc.)
+            error_msg = f"配置错误: {str(e)}"
+            print(f"  ✗ {error_msg}")
+            return f"# 报告生成失败\n\n{error_msg}"
 
         except ImportError as e:
-            return f"Error: openai package not installed. Run: pip install openai\nDetails: {str(e)}"
-        except Exception as e:
-            error_msg = f"Error generating AI report: {str(e)}"
+            error_msg = f"依赖缺失: openai 包未安装。请运行: pip install openai\n详情: {str(e)}"
             print(f"  ✗ {error_msg}")
-            return error_msg
+            return f"# 报告生成失败\n\n{error_msg}"
+
+        except Exception as e:
+            error_msg = f"生成报告时出错: {str(e)}"
+            print(f"  ✗ {error_msg}")
+            return f"# 报告生成失败\n\n{error_msg}"
 
 
 def analyze_all_bloggers() -> List[Dict[str, Any]]:

@@ -197,7 +197,7 @@ HEADLESS = True  # ✅ 生产环境使用无头模式
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 # 优化后（直接配置）
-DEEPSEEK_API_KEY = "YOUR_KEY"
+DEEPSEEK_API_KEY = ""
 ```
 
 ⚠️ **注意**: 此配置包含敏感信息，建议在提交前恢复为环境变量读取方式
